@@ -250,7 +250,7 @@ export function eciesUnwrap(
 }
 
 /** The two random inputs of {@link eciesWrap}, injectable so a spec can pin an envelope's bytes. */
-interface EciesWrapOptions {
+export interface EciesWrapOptions {
   /** The ephemeral P-256 private key for the exchange (32 bytes); generated fresh when absent. */
   ephemeralPrivateKey?: Buffer;
   /** The AES-128-CBC IV, which the envelope carries (16 bytes); random when absent. */
