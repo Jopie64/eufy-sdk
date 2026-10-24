@@ -51,6 +51,16 @@ describe("classify (device_type → codec)", () => {
     expect(classify({})).toBe("camera"); // safe read-only default
   });
 
+  it.each([undefined, DeviceType.CAMERA_POE_S4])(
+    "provides the PoE S4 camera surface for device type %s",
+    (deviceType) => {
+      const record = { model: "T8E00", deviceType, params: {} };
+      const codec = classify(record);
+      expect(codec).toBe("camera");
+      expect(detectCapabilities(record, codec)).toContain("camera");
+    },
+  );
+
   it("maps the eufy_life T8L0x light line to light — by prefix, incl. suffixed variants", () => {
     expect(classify({ model: "T8L02" })).toBe("light"); // registry-listed
     expect(classify({ model: "T8L02X" })).toBe("light"); // suffixed variant, no registry row
@@ -136,6 +146,33 @@ describe("resolveDevice — 3-tier composition", () => {
     expect(resolveDevice({ deviceType: 30 }).capabilities).not.toContain("ptz");
     expect(resolveDevice({ deviceType: 46 }).capabilities).not.toContain("ptz");
   });
+
+  it("does not advertise a spotlight from the params reported by T8171", () => {
+    // Three T8171 units on firmware 1.2.1.6 reported precisely these light-detection params.
+    const params = { 1400: "0", 1401: "80", 1403: "1" };
+    const e30 = resolveDevice({ model: "T8171", deviceType: DeviceType.SOLO_CAMERA_E30, params });
+    expect(e30.capabilities).not.toContain("light");
+    const properties = e30.properties.map((p) => p.name);
+    for (const name of ["light", "brightness", "spotlightEnabled", "colorTemp"]) {
+      expect(properties).not.toContain(name);
+    }
+    expect(resolveDevice({ model: "T8170", deviceType: 48, params }).capabilities).toContain("light");
+    for (const [param, value] of Object.entries(params)) {
+      expect(
+        resolveDevice({ model: "T8171", deviceType: DeviceType.SOLO_CAMERA_E30, params: { [param]: value } })
+          .capabilities,
+      ).not.toContain("light");
+    }
+  });
+
+  it.each([undefined, DeviceType.CAMERA_POE_S4])(
+    "recognizes PoE S4 pan-tilt without reported preset parameters (device type %s)",
+    (deviceType) => {
+      expect(
+        resolveDevice({ model: "T8E00", category: "eufy_security", deviceType, params: {} }).capabilities,
+      ).toContain("ptz");
+    },
+  );
 
   it("a normal solar cam (T8124R) is NOT pan-tilt — the mistaken model hint is gone", () => {
     // T8124R (deviceType 62 = SOLO_CAMERA_SPOTLIGHT_SOLAR) is a FIXED solar cam: it reports no PT param
@@ -268,6 +305,69 @@ describe("doorbell — confirmed against real T8214", () => {
     expect(r.name).toBe("Wired Doorbell 2K");
   });
 
+  it("types the T90S0 smoke alarm as a smoke sensor, not a camera", () => {
+    const r = resolveDevice({ model: "T90S0", name: "Hallway" });
+    expect(r.codec).toBe("sensor");
+    expect(r.capabilities).toContain("smoke");
+    expect(r.capabilities).not.toContain("camera");
+    expect(r.capabilities).not.toContain("video");
+  });
+
+  it("types the battery T8213 as a doorbell", () => {
+    // Without its registry row the raw T-code missed the doorbell model hint, so a T8213's presses
+    // arrived but the host built no doorbell event or ring trigger (ha-eufy-sdk#38).
+    const r = resolveDevice({ model: "T8213", deviceType: 91 });
+    expect(r.capabilities).toContain("doorbell");
+    expect(r.capabilities).toContain("battery");
+    expect(r.name).toBe("Video Doorbell Dual");
+  });
+
+  it("marks each manifest property with whether the device has reported it", () => {
+    const r = resolveDevice({ model: "T8113", deviceType: 1, params: { 1101: "80" } });
+    const spec = (name: string) => r.properties.find((p) => p.name === name);
+    expect(spec("battery")?.reported).toBe(true);
+    expect(spec("soloSensitivity")?.reported).toBe(false);
+    expect(spec("solarIntensity")?.reported).toBe(false);
+  });
+
+  it("flips a property to reported once a fresher record carries its param", () => {
+    const dev = Device.fromRecord("T8113R", { model: "T8113", deviceType: 1, params: { 1101: "80" } });
+    expect(dev.properties.find((p) => p.name === "solarIntensity")?.reported).toBe(false);
+    dev.reresolve({ model: "T8113", deviceType: 1, params: { 1101: "80", 1309: "3" } });
+    expect(dev.properties.find((p) => p.name === "solarIntensity")?.reported).toBe(true);
+  });
+
+  it("flags a realtime member reported only once its value arrives, keeping its getter before that", () => {
+    const record = { model: "T8L02", category: "eufy_life", params: {} };
+    const dev = Device.fromRecord("T8L02R", record);
+    expect(dev.properties.find((p) => p.name === "lightPower")?.reported).toBe(false);
+    dev.bindActions(
+      { codec: "light", model: "T8L02", category: "eufy_life", channel: 0, paramIds: new Set<number>() },
+      { dispatch: async () => {} },
+    );
+    expect("power" in (dev.smartLight?.() ?? {})).toBe(true);
+  });
+
+  it.each([5, 7, 16, 91, 93, 94])("types any record of the app's doorbell deviceType %i as a doorbell", (t) => {
+    expect(resolveDevice({ model: "T8299", deviceType: t }).capabilities).toContain("doorbell");
+  });
+
+  it.each(["T8201", "T8212", "T8220", "T8222"])("types the app's doorbell model %s as a doorbell", (model) => {
+    expect(resolveDevice({ model }).capabilities).toContain("doorbell");
+  });
+
+  it("types the T8210C variant as a doorbell, like the T8210", () => {
+    const r = resolveDevice({ model: "T8210C", deviceType: 7 });
+    expect(r.capabilities).toContain("doorbell");
+    expect(r.name).toBe("Video Doorbell");
+  });
+
+  it("names the T8354 Baby Monitor E21", () => {
+    const r = resolveDevice({ model: "T8354", deviceType: 86 });
+    expect(r.source).toBe("model");
+    expect(r.name).toBe("Baby Monitor E21");
+  });
+
   it("decodes real doorbell param values (chime on, ringtone vol 80, notification JSON)", () => {
     const dev = Device.fromRecord("T8214DB", {
       model: "T8214",
@@ -278,6 +378,16 @@ describe("doorbell — confirmed against real T8214", () => {
     expect(dev.getProperty("ringtoneVolume")?.value).toBe(80);
     // notificationMode is json-encoded → decoded to a structured object
     expect(dev.getProperty("notificationMode")?.value).toMatchObject({ notification_ring_onoff: 1 });
+  });
+});
+
+describe("video lock — confirmed against real T8530", () => {
+  it("gives the video lock T8530 a camera beside its lock codec", () => {
+    const r = resolveDevice({ model: "T8530", deviceType: DeviceType.LOCK_8530, parentSn: "T8030P0000000000" });
+    expect(r.codec).toBe("lock");
+    expect(r.capabilities).toContain("lock");
+    expect(r.capabilities).toContain("camera");
+    expect(r.name).toBe("Video Smart Lock S330");
   });
 });
 

@@ -44,7 +44,7 @@
 # publishing stops working — the failure looks like an auth error, not a config error.
 #
 # Nothing long-lived is stored in this repo, so there is no token to leak, rotate, or expire. It
-# requires npm ≥ 11.5.1, which is why the toolchain npm is upgraded below, and `id-token: write` in
+# requires npm ≥ 11.5.1, which Node 24.5.0 bundles and a step below asserts, and `id-token: write` in
 # the permissions block.
 #
 # A package's very first publish cannot use this path: npm has no way to pre-register a trusted
@@ -121,23 +121,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24.5.0
           cache: npm
           registry-url: "https://registry.npmjs.org"
 
-      # OIDC trusted publishing needs npm >= 11.5.1, which Node 24.5.0 already bundles. The major is
-      # pinned rather than tracking `npm@latest`, because npm's own Node floor moves independently of
-      # the Node version pinned here: npm 12 requires ^22.22.2 || ^24.15.0 || >=26 and will not
-      # install on this runtime.
+      # OIDC trusted publishing needs npm >= 11.5.1, which Node 24.5.0 already bundles, so the release
+      # runs the same npm as CI.
       #
       # The assertion is the point of the step. An npm below the floor fails publishing as an
       # authentication error several steps later, with nothing pointing at the cause; this names it.
       - name: Ensure npm can do OIDC
         run: |
           set -euo pipefail
-          npm install -g npm@^11
           need=11.5.1
           have="$(npm --version)"
           # sort -V puts the lower version first; if that is not `need`, then have < need.

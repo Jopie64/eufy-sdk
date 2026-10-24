@@ -1,6 +1,6 @@
 {
   "name": "@mega-yfue/eufy-sdk",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "One typed TypeScript client for the Anker eufy v6 cloud — capability-driven devices, realtime events over P2P/MQTT/push, and live media",
   "license": "Apache-2.0",
   "author": "mega-yfue",
@@ -73,14 +73,15 @@
   },
   "dependencies": {
     "jpeg-js": "^0.4.4",
-    "mqtt": "^5.16.0",
-    "protobufjs": "^8.8.0"
+    "mqtt": "^5.16.1",
+    "node-datachannel": "^0.33.4",
+    "protobufjs": "^8.8.1"
   },
   "devDependencies": {
-    "@types/node": "^26.6.3",
+    "@types/node": "^26.6.5",
     "esbuild": "^0.28.2",
-    "prettier": "^3.9.9",
+    "prettier": "^3.9.10",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.2"
+    "vitest": "^5.0.5"
   }
 }

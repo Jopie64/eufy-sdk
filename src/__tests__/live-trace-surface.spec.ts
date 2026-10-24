@@ -44,6 +44,7 @@ describe("live-trace vocabulary at the package entry point", () => {
       "session-unreachable": true,
       "level2-wait": true,
       "level2-ready": true,
+      "level2-set-payload-only": true,
       "level2-unavailable": true,
       "level2-negotiating": true,
       "station-resolved": true,
@@ -53,6 +54,7 @@ describe("live-trace vocabulary at the package entry point", () => {
       "media-command-unsent": true,
       "path-stale": true,
       "channel-silent": true,
+      "start-failed": true,
     } satisfies Record<LiveTrace["phase"], true>;
     expect(Object.keys(handled)).toContain("sequence-restart");
   });

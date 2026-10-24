@@ -20,25 +20,22 @@ import { AccessUnitAssembler, VideoFrameDecoder } from "./video.js";
 import { sniffAnnexbCodec } from "./annexb.js";
 import { noopLogger, type Logger } from "../../core/logger.js";
 import { traceLiveStart, type LiveTrace } from "./live-trace.js";
-import type { AudioCodec, LiveAudioFrame, LiveVideoFrame, VideoCodec } from "../../core/contracts.js";
+import type { LiveAudioFrame, LiveVideoFrame, VideoCodec } from "../../core/contracts.js";
+import { AUDIO_CODECS, AUDIO_HEADER_LEN, AUDIO_TYPE_OFFSET, CMD_AUDIO_FRAME } from "./audio-frame.js";
 
 const CMD_VIDEO_FRAME = 1300;
-const CMD_AUDIO_FRAME = 1301;
 const VIDEO_HEADER_LEN = 0x16; // 22-byte CMD_VIDEO_FRAME header before the Annex-B payload
-const AUDIO_HEADER_LEN = 0x10; // 16-byte CMD_AUDIO_FRAME header before the audio payload
-/** Byte offset of the codec id between the frame-size and frame-number fields. */
-const AUDIO_TYPE_OFFSET = 0x05;
 const SC4 = Buffer.from([0, 0, 0, 1]);
 const SC3 = Buffer.from([0, 0, 1]);
 
 /**
- * Codec ids the station puts at {@link AUDIO_TYPE_OFFSET}, as the v6 app maps them
- * (`AudioReader.AAC_LC = 0`, `G711A = 2`, `AAC_ELD = 7`).
+ * AudioSpecificConfig (ISO/IEC 14496-3) of a station's `aac-eld` audio, which the station does not send: an
+ * `aac-eld` frame carries one raw access unit after its 16-byte header, with no transport framing.
  *
- * The app's `PCM_SILENCE = -1` is absent on purpose: it is not a wire value. The app injects it
- * itself when a stream produces no audio at all, to feed its decoder silence.
+ * Fields: audio object type 39 (ER AAC-ELD), 16 kHz, mono, 480-sample frames, no LD-SBR. These are the bytes the
+ * v6 app's native AAC decoder (`AudioFDKDecode`) configures libfdk with for raw ELD access units.
  */
-const AUDIO_CODECS: Readonly<Record<number, AudioCodec>> = { 0: "aac-lc", 2: "g711a", 7: "aac-eld" };
+const AAC_ELD_AUDIO_SPECIFIC_CONFIG = Buffer.from("f8f03000", "hex");
 
 /**
  * Undecodable video payloads traced per stream. Every frame of a stream whose cipher this build cannot read
@@ -131,6 +128,12 @@ export class LiveStream extends EventEmitter {
   private lastCodec: VideoCodec = "h264";
   /** Rebuilds an access unit the station split across several frames — see {@link AccessUnitAssembler}. */
   private readonly units = new AccessUnitAssembler((drop) => this.reportDroppedUnit(drop));
+  /** Whether a missing video datagram or incomplete unit invalidated the current reference chain. */
+  private awaitingKeyframeAfterGap = false;
+  private readonly videoGapHandler = () => {
+    this.units.discard();
+    this.awaitingKeyframeAfterGap = true;
+  };
   /** The channel inbound media must be tagged with, once {@link acceptsMedia} trusts the station's tag. */
   private mediaChannel?: number;
   private tracedFirstVideoCommand = false;
@@ -173,6 +176,7 @@ export class LiveStream extends EventEmitter {
     if (this.listening) return this;
     this.listening = true;
     this.session.on("data", this.handler);
+    this.session.on("videoGap", this.videoGapHandler);
     this.session.on("liveStartUnacknowledged", this.unackedHandler);
     this.sendStart();
     const keepAliveMs = this.opts.keepAliveMs ?? DEFAULT_KEEPALIVE_MS;
@@ -271,6 +275,8 @@ export class LiveStream extends EventEmitter {
     if (!this.listening) return;
     this.listening = false;
     this.session.off("data", this.handler);
+    this.session.off("videoGap", this.videoGapHandler);
+    this.awaitingKeyframeAfterGap = false;
     this.session.off("liveStartUnacknowledged", this.unackedHandler);
     if (this.kaTimer) clearInterval(this.kaTimer);
     this.kaTimer = undefined;
@@ -306,6 +312,10 @@ export class LiveStream extends EventEmitter {
     try {
       if (f.commandId === CMD_VIDEO_FRAME) {
         for (const unit of this.units.push(f.data, (payload) => this.annexbOf(payload, f.signCode))) {
+          if (this.awaitingKeyframeAfterGap) {
+            if (!unit.keyframe) continue;
+            this.awaitingKeyframeAfterGap = false;
+          }
           if (!this.tracedFirstVideoUnit) {
             this.tracedFirstVideoUnit = true;
             this.trace({ phase: "first-video-unit", keyframe: unit.keyframe });
@@ -319,6 +329,7 @@ export class LiveStream extends EventEmitter {
           if (unit.keyframe) this.lastCodec = sniffAnnexbCodec(unit.data) ?? this.lastCodec;
           this.settleKeepalive();
           this.emit("video", {
+            sourceTimestamp: unit.sourceTimestamp,
             keyframe: unit.keyframe,
             width: unit.width,
             height: unit.height,
@@ -334,7 +345,12 @@ export class LiveStream extends EventEmitter {
           if (!codec) {
             this.logger.debug(`[live] dropping audio frame: unknown codec id ${codecId ?? "missing"}`);
           } else {
-            this.emit("audio", { codec, data: audio });
+            this.emit(
+              "audio",
+              codec === "aac-eld"
+                ? { codec, data: audio, config: AAC_ELD_AUDIO_SPECIFIC_CONFIG }
+                : { codec, data: audio },
+            );
           }
         }
       }
@@ -402,6 +418,7 @@ export class LiveStream extends EventEmitter {
    * otherwise silent in both directions: no frame reaches a consumer, and nothing states why.
    */
   private reportDroppedUnit(drop: { carried: number; chunks: number; count: number }): void {
+    this.awaitingKeyframeAfterGap = true;
     const message = `[live] dropped an incomplete access unit (${drop.carried} bytes in ${drop.chunks} frame(s), tail never arrived, ${drop.count} so far)`;
     if (drop.count === 1) this.logger.warn(message);
     else this.logger.debug(message);

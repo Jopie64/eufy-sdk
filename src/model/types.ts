@@ -71,6 +71,10 @@ export type Capability =
   | "vacuum_dock"
   | "suction"
   | "locate"
+  // Robot-mower state from its own Tuya DP space (read-only).
+  | "mower"
+  // SmartDrop parcel box: open the lid.
+  | "smart_drop"
   // eufy_life smart lighting (own secure-MQTT DP namespace) — the T8L0x line's on/off/brightness/
   // effect control. Distinct from the camera-floodlight `light` capability above.
   | "smart_light"
@@ -93,11 +97,12 @@ export type PropertyValueType = "bool" | "number" | "string" | "enum";
  * one as the other is wrong in a way no type check catches.
  *
  *  - `boolean` — an on/off state (always paired with `type: "bool"`).
- *  - `percent` / `celsius` / `dbm` / `seconds` / `hours` / `megabytes` / `degrees` — a measured quantity
- *    in the unit the device reports it in; each pairs with the matching `unit`. Values are
- *    never converted on the way out — a converted reading is an invented one. `seconds` and `hours`
- *    are separate kinds for exactly that reason: a robot reports a run in seconds and a consumable's
- *    wear in hours, and normalising one into the other would publish a number the device never sent.
+ *  - `percent` / `celsius` / `dbm` / `seconds` / `hours` / `minutes` / `millimetres` / `megabytes` /
+ *    `degrees` — a measured quantity in the unit the device reports it in; each pairs with the
+ *    matching `unit`. Values are never converted on the way out — a converted reading is an invented
+ *    one. `seconds`, `minutes` and `hours` are separate kinds for exactly that reason: a robot reports
+ *    a run in seconds, a mower its blade wear in minutes and a vacuum's consumable wear in hours, and
+ *    normalising one into another would publish a number the device never sent.
  *  - `scalar` — a plain number in no unit at all: a step on a ladder, a mode index, a raw level, a
  *    segment count. Ordered and comparable, but its range and direction are the device's, so nothing
  *    but the device says what a given value means.
@@ -131,6 +136,8 @@ export const KNOWN_VALUE_KINDS = [
   "dbm",
   "seconds",
   "hours",
+  "minutes",
+  "millimetres",
   "megabytes",
   "degrees",
   "scalar",
@@ -168,7 +175,8 @@ export function isKnownValueKind(kind: ValueKind): kind is KnownValueKind {
 /**
  * How much a param's name and meaning can be trusted, most-trusted first. This is the one definition;
  * the param dictionary and every `provenance` field use it.
- *  - `mega`     — the vendor's cloud names it: its data-point catalog (`get_product_data_point`), or a
+ *  - `mega`     — the vendor's cloud names it: its data-point catalog (`get_product_data_point`), the
+ *                 Tuya product schema of an `eufy_home_tuya` device (`thing.m.device.ref.info.list`), or a
  *                 reported value that matches what the cloud record already says (a model name or code).
  *  - `verified` — confirmed on a real device by this project: our own capture or observation, or
  *                 identified by someone who has the hardware.
@@ -203,6 +211,11 @@ export interface PropertySpec {
   kind?: ValueKind;
   /** Whether the value can be written back to the device (a setter exists). */
   writable: boolean;
+  /**
+   * Whether the device has reported this value: its own param, a read alias, or the payload it reads
+   * from. `false` means it never has. Absent when the manifest was built without the device's params.
+   */
+  reported?: boolean;
   /** Allowed values for `type: "enum"` (raw → label). */
   enumValues?: Record<number, string>;
   /**
@@ -233,10 +246,11 @@ export interface PropertySpec {
    * consumable counters are `"number"` over one base64 string, and reading the value as a number is
    * exactly what must NOT happen at ingest.
    *
-   * Storage already keeps such a value intact — a non-numeric string cannot be coerced to a number, so
-   * it is passed through. What this flag changes is that the pass-through stops being reported as a
-   * mistake: a robot reporting ten Raw DPs on every push logged ten warnings a time saying its
-   * properties were misdeclared, which is how a real warning goes unread.
+   * Storage keeps such a value intact: a non-numeric string passes a `number` coercion unchanged, and
+   * on a `bool` property a string that is not a boolean wire form (`"0"`, `"1"`, `"true"`, `"false"`)
+   * is kept rather than read as `false`. The pass-through is not reported as a mistake: a robot
+   * reporting ten Raw DPs on every push logged ten warnings a time saying its properties were
+   * misdeclared, which is how a real warning goes unread.
    */
   raw?: true;
   /**
@@ -361,6 +375,12 @@ export interface CloudRecord {
   parentSn?: string;
   /** Reported param_type → raw value. Presence of a param is a capability signal. */
   params?: Record<number, string>;
+  /**
+   * Params the device reported over its realtime channel, keyed in the device's own namespace. A line
+   * whose state exists only on that channel carries none of it in {@link params}, so this is the
+   * evidence an availability gate on such a param is decided from.
+   */
+  dpParams?: Record<number, string>;
 }
 
 /** The fully-resolved device shape produced by the 3-tier resolver. */

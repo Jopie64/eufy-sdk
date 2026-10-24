@@ -1,8 +1,8 @@
 import { enumLabels } from "../../core/util.js";
-import { describeDevice, setJsonRaw, setPayload } from "./access.js";
+import { describeDevice, setJsonRaw, setPayload, setStationScalar } from "./access.js";
 import { accepts, method, propertiesOf, type Members, type Surface } from "./members.js";
-import type { CapabilityModule, CommandContext } from "./types.js";
-import { CusPushEvent } from "../push-events.js";
+import type { CapabilityModule, CapabilityStateReader, CommandContext, InboundSignal } from "./types.js";
+import { CusPushAlarmType, CusPushEvent } from "../push-events.js";
 import type { Command } from "../../core/contracts.js";
 
 /** The station broadcast channel the HomeBase's own controls ride (not a device channel). */
@@ -85,10 +85,13 @@ export const ARMING_CMD = {
    * The ENCRYPTION LEVEL is the session's to pick (`"auto"`), not this command's: the T8030 the envelope
    * was captured on holds a level-2 key and seals it level-2, while an own-session camera that never
    * negotiates one carries the same envelope level-1. See `armingCommand`.
+   *
+   * A T8410C takes the mode as a direct frame instead of this envelope; see {@link DIRECT_ARMING_MODELS}.
    */
   SET_ARMING: 1224,
   /**
-   * The per-mode alarm/arm-delay configuration write. ✅ WIRE CAPTURED live on a T8030 (
+   * One guard mode's per-device action table (app `CMD_SET_ALL_ACTION`), which carries the alarm delays
+   * and each device's actions in that mode. ✅ WIRE CAPTURED live on a T8030 (
    * 2026-07-23, both directions): a **bare
    * JSON frame, no `1350`/`1700` envelope** — outer P2P cmd IS `1255` itself, station channel 255,
    * plaintext `{account_id, count_down_alarm:{channel_list,delay_time},
@@ -105,15 +108,82 @@ export const ARMING_CMD = {
    * corresponding GET command (`1310`/inner cmd `40003`, sent by the app right before editing) always
    * replied `{count:0,data:null}` in every capture — genuinely empty, not a decrypt failure (confirmed
    * via the same bidirectional decrypt this finding used) — so the app does NOT read the current
-   * config this way; how it does is still unknown. Without a working GET, safely PATCHING just one
-   * channel in or out of an existing list isn't possible without risking clobbering the rest — so
+   * config this way; a T8010 reports it on its own params instead, see below. Without a working GET,
+   * safely PATCHING just one channel in or out of an existing list isn't possible without risking
+   * clobbering the rest — so
    * this ships as a caller-supplies-everything write instead of guessing a merge.
    * `devices`/`siren_sensor_action` are even less understood (raw per-device action codes, meaning
    * unconfirmed) and MUST come from a value independently read/captured for the target mode —
    * see `AlarmDelayConfig`'s field docs.
+   *
+   * ✅ On a T8010 the app writes the same command for the Device Control screen: header channel 0, the
+   * whole table of the mode `{mode_id, devices, count_down_alarm, count_down_arm}`, acked by an all-zero
+   * 1255 reply. The T8010 reports each table on its own params, Home on 1157 and Away on 1158, and the
+   * reported table follows a write within 15 s. See {@link DEVICE_NOTIFY_FLAG}.
    */
-  ALARM_DELAY_CONFIG: 1255,
+  SET_ALL_ACTION: 1255,
 } as const;
+
+/**
+ * The push-notification flag of a device's `action` in a mode's table, where `action` is
+ * `(mode_id << 24) | flags`. The app's Notification checkbox sets and clears this bit alone, on cameras
+ * (9/1) and sensors (8/0) alike; the other flags are not identified and are carried through unchanged.
+ */
+const DEVICE_NOTIFY_FLAG = 0x08;
+
+/**
+ * The guard modes whose device notification is read and written. Home and away are replayed on a T8010;
+ * `custom1` (wire 3) is captured on a T8170, whose own params report it on 1148.
+ */
+export type DeviceNotificationMode = Extract<ArmingMode, "home" | "away" | "custom1">;
+
+/**
+ * The standalone cameras whose own Device Control write is confirmed: cmd 1255 to the camera itself with only
+ * its own entry `{mode_id, devices:[{device_channel, action}]}`, the new flags reported back after it.
+ * ✅ T8170: wire-captured (2026-10-09, 2026-10-11). ✅ T8171: confirmed live both ways (2026-10-12, Home
+ * 9 → 1 → 9 in its cloud params). ✗ A T8400, T8442 and T8410 did not acknowledge it within 20 s and kept
+ * their flags (2026-10-12), so they are read only.
+ */
+const STANDALONE_ACTION_MODELS: ReadonlySet<string> = new Set(["T8170", "T8171"]);
+
+/**
+ * The models whose guard-mode write is the direct frame: outer command 1224 itself at level 2, body
+ * `u32 LE mode_type ‖ admin account id zero-padded to 128 bytes` (the `p2p-station-scalar` frame), rather
+ * than the `1350` set-payload envelope. Taken from the vendor app's own frame on a T8410C, where Home
+ * (`mode_type` 1) and Away (`mode_type` 0) were captured and decrypted 2026-10-17, and where the camera
+ * answers the `1350` form with result -103 at both level 1 and level 2. Away (0), Home (1) and Disarmed
+ * (63) were each also sent as this frame live on 2026-10-17: the camera answered each on outer 1224 with
+ * result 0 and param 1224 reported the requested mode within the readback window. Only those three modes
+ * are written on this frame ({@link DIRECT_ARMING_MODES}). No other model is confirmed for this frame.
+ */
+const DIRECT_ARMING_MODELS: ReadonlySet<string> = new Set(["T8410C"]);
+
+/** The modes confirmed on the direct frame; any other throws. */
+const DIRECT_ARMING_MODES: ReadonlySet<ArmingMode> = new Set<ArmingMode>(["away", "home", "disarmed"]);
+
+/** The standalone cameras whose own flags are read live: the two above plus the three that stay read only. */
+const STANDALONE_READ_MODELS: ReadonlySet<string> = new Set([...STANDALONE_ACTION_MODELS, "T8400", "T8442", "T8410"]);
+
+/**
+ * A device's own flags for `mode`, as its params report them: Home on 1225, Away on 1239, custom1 on 1148,
+ * plain flags without the `mode_id << 24` the write carries. Every device reports these, standalone or
+ * attached; a standalone camera has no table, so they are its only source.
+ */
+function ownAction(read: CapabilityStateReader, mode: DeviceNotificationMode): number | undefined {
+  const value = Number(read(`${mode}Action`)?.value);
+  return Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
+/** One mode's action table as reported; every field beside `devices` is carried through untouched. */
+type ActionTable = Record<string, unknown> & { devices: { device_channel: number; action: number }[] };
+
+/** The reported action table of `mode`, or `undefined` when the station reports none. */
+function actionTable(read: CapabilityStateReader, mode: DeviceNotificationMode): ActionTable | undefined {
+  const value = read(`${mode}ActionTable`)?.value;
+  return value && typeof value === "object" && Array.isArray((value as ActionTable).devices)
+    ? (value as ActionTable)
+    : undefined;
+}
 
 /**
  * Guard-mode name → the wire's `mode_type` integer, for every mode a station may REPORT. Fixed (not
@@ -194,6 +264,12 @@ function armingModeOf(v: boolean | number | string): ArmingMode | undefined {
 function armingCommand(mode: ArmingMode, ctx: CommandContext): Command {
   if (!ctx.accountName) {
     throw new Error(`arming: missing account identity (user_name) [${describeDevice(ctx)}]`);
+  }
+  if (DIRECT_ARMING_MODELS.has(ctx.model ?? "")) {
+    if (!DIRECT_ARMING_MODES.has(mode)) {
+      throw new Error(`arming: mode ${mode} is unconfirmed on the direct 1224 frame [${describeDevice(ctx)}]`);
+    }
+    return setStationScalar(ARMING_CMD.SET_ARMING, ARMING_MODE_WIRE[mode], ctx.channel);
   }
   return setPayload(
     ARMING_CMD.SET_ARMING,
@@ -280,7 +356,37 @@ function alarmDelayCommand(mode: AlarmDelayMode, config: AlarmDelayConfig, ctx: 
     devices: config.devices.map((d) => ({ action: d.action, device_channel: d.deviceChannel })),
     siren_sensor_action: config.sirenSensorAction.map((d) => ({ action: d.action, device_channel: d.deviceChannel })),
   };
-  return setJsonRaw(ARMING_CMD.ALARM_DELAY_CONFIG, data, ctx, STATION_CHANNEL);
+  return setJsonRaw(ARMING_CMD.SET_ALL_ACTION, data, ctx, STATION_CHANNEL);
+}
+
+/**
+ * A standalone camera's one-entry table for `mode`, built from its own reported flags: what the app sends it.
+ * `undefined` where the camera reports none for that mode.
+ */
+function ownTable(read: CapabilityStateReader, mode: DeviceNotificationMode, channel: number): ActionTable | undefined {
+  const flags = ownAction(read, mode);
+  if (flags === undefined) return undefined;
+  const wire = ARMING_MODE_WIRE[mode];
+  return { mode_id: wire, devices: [{ device_channel: channel, action: (wire << 24) | flags }] };
+}
+
+/** How long a reported action table may lag a write before it is trusted again: it follows within 15 s. */
+const ACTION_TABLE_LAG_MS = 15_000;
+
+/**
+ * One device's notification flag in `table` changed, or `undefined` when `table` does not list `channel`,
+ * since only the table states the entry's other flags. `account_id` is dropped: the sink injects the
+ * acting account's.
+ */
+function withDeviceNotification(table: ActionTable | undefined, channel: number, on: boolean): ActionTable | undefined {
+  if (!table?.devices.some((d) => d.device_channel === channel)) return undefined;
+  const { account_id: _account, ...rest } = table;
+  const devices = table.devices.map((d) =>
+    d.device_channel === channel
+      ? { ...d, action: on ? d.action | DEVICE_NOTIFY_FLAG : d.action & ~DEVICE_NOTIFY_FLAG }
+      : d,
+  );
+  return { ...rest, devices };
 }
 
 /**
@@ -327,7 +433,8 @@ export const ARMING_MEMBERS = {
       "Guard mode (verified: param 1224 = GUARD_MODE, read/write mechanism confirmed). Reads and SETS all " +
       "9 modes the app defines — away/home/schedule/custom1/custom2/custom3/off/geo/disarmed. Three are " +
       "byte-captured writes and six are live-confirmed (each sent and observed to report its own " +
-      "MODE_SWITCH); see ARMING_MODE_WIRE in arming.ts for the per-value evidence.",
+      "MODE_SWITCH); see ARMING_MODE_WIRE in arming.ts for the per-value evidence. On a T8410C only " +
+      "away, home and disarmed are writable.",
     observation: {
       event: "armingModeChanged",
       reflects: (value) => ({ param: ARMING_CMD.SET_ARMING, expected: ARMING_MODE_WIRE[armingModeOf(value)!] }),
@@ -365,7 +472,76 @@ export const ARMING_MEMBERS = {
       },
     "Write the full per-mode alarm/arm-delay configuration.",
   ),
+
+  /**
+   * Whether the device on `channel` sends a push notification in `mode`: its {@link DEVICE_NOTIFY_FLAG}
+   * in the action table the station reports for that mode. `undefined` where the station reports no table
+   * or the table does not list `channel`. A standalone camera answers from its own 1225/1239/1148 flags,
+   * for its own channel only. A device's channel is `EufyDevice.channel`.
+   */
+  deviceNotification: method(
+    ({ ctx, read }) =>
+      (mode: DeviceNotificationMode, channel: number): boolean | undefined => {
+        const action =
+          ctx.model === "T8010"
+            ? actionTable(read, mode)?.devices.find((d) => d.device_channel === channel)?.action
+            : channel === ctx.channel
+              ? ownAction(read, mode)
+              : undefined;
+        return typeof action === "number" ? (action & DEVICE_NOTIFY_FLAG) !== 0 : undefined;
+      },
+    "Whether the device on a channel sends a push notification in a guard mode (home/away/custom1).",
+    (ctx) => ctx.model === "T8010" || STANDALONE_READ_MODELS.has(ctx.model ?? ""),
+  ),
+
+  /**
+   * Turn the push notification of the device on `channel` on or off in `mode` (cmd
+   * {@link ARMING_CMD.SET_ALL_ACTION}): the station's reported table written back with that one flag
+   * changed. A standalone camera is sent a one-entry `{mode_id, devices}` table built from its own flags,
+   * for its own channel only. Rejects, sending nothing, where the table does not list `channel`. A write
+   * builds on the last one sent for that mode until the device reports a table (`${mode}Action` on a
+   * standalone camera) observed 15 s after it, so a second write does not revert it; a write whose dispatch
+   * rejects is not built on.
+   */
+  setDeviceNotification: method(
+    ({ ctx, sink, read }) => {
+      const sent = new Map<DeviceNotificationMode, { table: ActionTable; at: number }>();
+      return (mode: DeviceNotificationMode, channel: number, on: boolean): Promise<void> => {
+        const last = sent.get(mode);
+        const reported = ctx.model === "T8010" ? `${mode}ActionTable` : `${mode}Action`;
+        const observed = read(reported)?.ts ?? 0;
+        const base =
+          last && observed < last.at + ACTION_TABLE_LAG_MS
+            ? last.table
+            : ctx.model === "T8010"
+              ? actionTable(read, mode)
+              : ownTable(read, mode, ctx.channel);
+        const table = withDeviceNotification(base, channel, on);
+        if (!table) {
+          return Promise.reject(
+            new Error(`arming: no ${mode} action table lists channel ${channel} [${describeDevice(ctx)}]`),
+          );
+        }
+        sent.set(mode, { table, at: Date.now() });
+        return sink.dispatch(setJsonRaw(ARMING_CMD.SET_ALL_ACTION, table, ctx, 0)).catch((err: unknown) => {
+          if (sent.get(mode)?.table === table) {
+            if (last) sent.set(mode, last);
+            else sent.delete(mode);
+          }
+          throw err;
+        });
+      };
+    },
+    "Turn the push notification of the device on a channel on or off in a guard mode (home/away/custom1).",
+    (ctx) => ctx.model === "T8010" || STANDALONE_ACTION_MODELS.has(ctx.model ?? ""),
+  ),
 } as const satisfies Members;
+
+/** `"stopped"` when the push's `type` is a stop code, otherwise `"triggered"`. */
+function decodeAlarmPhase(signal: InboundSignal): Record<string, unknown> {
+  const type = signal.source === "push" ? signal.payload?.["type"] : undefined;
+  return type === CusPushAlarmType.HUB_STOP_BY_APP ? { phase: "stopped" } : {};
+}
 
 /**
  * `arming` — guard/arming mode. `armingMode` (see {@link ARMING_CMD.SET_ARMING}) has a verified read/write
@@ -387,8 +563,9 @@ export const ARMING: CapabilityModule = {
    * generic `CusPushEvent` channel, so these ids are shared with other families and resolve by
    * capability (see the barrel's event index).
    *
-   * The alarm ids carry a static `phase` so one event name covers the whole lifecycle, the same shape
-   * `battery` uses for its threshold pushes. The mode-switch push is known to identify WHICH mode and
+   * The alarm ids carry a `phase` so one event name covers the whole lifecycle: the countdown push a
+   * static `"delayed"`, the alarm push a `"triggered"` or `"stopped"` read from its alarm type (see
+   * {@link decodeAlarmPhase}). The mode-switch push is known to identify WHICH mode and
    * what triggered the change, but neither has been observed on the wire here, so this emits the bare
    * transition and refreshes the `mode` read rather than trusting a decoded field.
    */
@@ -399,7 +576,13 @@ export const ARMING: CapabilityModule = {
       emit: "armingModeChanged",
       refresh: { member: "mode" },
     },
-    { source: "push", match: CusPushEvent.ALARM, emit: "alarm", payload: { phase: "triggered" } },
+    {
+      source: "push",
+      match: CusPushEvent.ALARM,
+      emit: "alarm",
+      payload: { phase: "triggered" },
+      derive: decodeAlarmPhase,
+    },
     { source: "push", match: CusPushEvent.ALARM_DELAY, emit: "alarm", payload: { phase: "delayed" } },
   ],
 };

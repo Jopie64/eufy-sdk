@@ -51,14 +51,16 @@ export const MODEL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
 
   // Cameras with curated extras that aren't always provable from a fresh device's params.
   T8423: { codec: "camera", caps: ["light", "battery"], name: "Floodlight Cam" },
-  T8210: { codec: "camera", caps: ["doorbell", "battery"], name: "Video Doorbell" },
+  T8210: { codec: "camera", caps: ["battery"], name: "Video Doorbell" },
+  // T8210 hardware variant, reported as its own code; shares the T8210 row.
+  T8210C: { codec: "camera", caps: ["battery"], name: "Video Doorbell" },
   // Confirmed against a real owned unit (named "Doorbell"): Video Doorbell Dual.
-  T8214: { codec: "camera", caps: ["doorbell", "battery"], name: "Video Doorbell Dual" },
+  T8214: { codec: "camera", caps: ["battery"], name: "Video Doorbell Dual" },
+  T8213: { codec: "camera", caps: ["battery"], name: "Video Doorbell Dual" },
   // Confirmed against a real owned unit: the mains-powered Wired Doorbell 2K. No `battery` row
   // member on purpose — this model is wired, so the codec baseline plus inference is the whole
-  // truth for power. Without this row it classified as a plain camera, so the doorbell capability
-  // never appeared and consumers got no doorbell event entity or ring trigger.
-  T8200: { codec: "camera", caps: ["doorbell"], name: "Wired Doorbell 2K" },
+  // truth for power.
+  T8200: { codec: "camera", name: "Wired Doorbell 2K" },
 
   // Cameras observed on real owned hardware (inspect-device sweep). Names from the app's own
   // model-family constants (scripts/data/app_model_registry.json); caps mirror what the device
@@ -68,22 +70,28 @@ export const MODEL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
   // whole fleet (verified live): SoloCam (T8170/T8171) via their reported PTZ preset params
   // (6090/6091/6092, 6210); Indoor-PT (T8410) via its vendor deviceType 31 = INDOOR_PT_CAMERA.
   // The rotate command (6030) is write-only and leaves no param trace, so it is never the signal.
-  // `light` (spotlight) is NOT hardcoded — it's detected from real spotlight params (light.ts),
-  // so devices with a spotlight (T8170: 1400/1401/1403; T8442: 6080/6082) get it
-  // and LED-only cams (T8171/T8400/T8410) correctly do NOT. The status LED (1045) is `camera`.
+  // T8171 reports 1400/1401/1403 on firmware 1.2.1.6 but has no physical spotlight.
+  // Those params are not light evidence for this exact model; light.ts excludes it.
   // `arming` here is the STANDALONE case only — `ownedByStation` withholds it again once the record
   // shows a parent, so an attached cam never advertises the hub's guard mode.
   T8170: { codec: "camera", caps: ["battery", "arming"], name: "SoloCam" },
   T8171: { codec: "camera", caps: ["battery", "arming"], name: "T8171" },
+  // Baby Monitor E21, vendor deviceType 86 (category eufy_care), standalone.
+  T8354: { codec: "camera", name: "Baby Monitor E21" },
   T8400: { codec: "camera", caps: ["arming"], name: "Indoor Cam" },
   T8410: { codec: "camera", caps: ["arming"], name: "Indoor Cam Pan & Tilt" },
   T8442: { codec: "camera", caps: ["arming"], name: "Indoor/Outdoor Cam 1080p" },
   // Hardwired wall-light camera; mains power asserted in MAINS_CAMERA_MODELS.
   T84A1: { codec: "camera", name: "Wall Light Cam S100" },
 
+  // Video lock: device_type says lock, it also streams (live view verified, HomeBase 3-attached).
+  T8530: { codec: "lock", caps: ["camera"], name: "Video Smart Lock S330" },
+
   // Sensors — the concrete sensor kind is curated (DeviceType 2 alone is ambiguous).
   T8900: { codec: "sensor", caps: ["contact"], name: "Entry Sensor" },
   T8910: { codec: "sensor", caps: ["battery"], name: "Motion Sensor" },
+  // Smoke Alarm E10. `smoke` is curated: its model hint matches the name, not the T-code.
+  T90S0: { codec: "sensor", caps: ["smoke"], name: "Smoke Alarm E10" },
 
   // Keypad (DeviceType 11).
   T8960: { codec: "keypad", name: "Keypad" },
@@ -242,13 +250,15 @@ export function resolveDevice(rec: CloudRecord): ResolvedDevice {
  * The property manifest for a device, from its capabilities and the record's facts. The single place
  * an {@link AvailabilityContext} is built — so a family-gate (`available`) and a per-model enum
  * (`enumValuesFor`) are decided from the same truthful, session-free view on every path (initial
- * resolve and {@link Device.reresolve}). Populated only from what a record carries, never transport
- * fields a live session hasn't produced.
+ * resolve and {@link Device.reresolve}). Populated only from what a record carries: its cloud params and
+ * the params its device reported over realtime, the same evidence a bound getter is gated on. Never
+ * transport fields a live session hasn't produced.
  */
 export function resolveProperties(rec: CloudRecord, codec: Codec, capabilities: Capability[]): PropertySpec[] {
   const paramIds = new Set<number>();
-  if (rec.params && typeof rec.params === "object") {
-    for (const k of Object.keys(rec.params)) {
+  for (const reported of [rec.params, rec.dpParams]) {
+    if (!reported || typeof reported !== "object") continue;
+    for (const k of Object.keys(reported)) {
       const n = Number(k);
       if (Number.isFinite(n)) paramIds.add(n);
     }

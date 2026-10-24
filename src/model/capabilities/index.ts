@@ -89,9 +89,11 @@ import { STORAGE } from "./storage.js";
 import { VACUUM_CLEAN } from "./vacuum-clean.js";
 import { VACUUM_DOCK } from "./vacuum-dock.js";
 import { SUCTION } from "./suction.js";
+import { MOWER } from "./mower.js";
 export { type DpCatalog, EMPTY_DP_CATALOG } from "./dp-catalog.js";
 import { DISPLAY } from "./display.js";
 import { LOCATE } from "./locate.js";
+import { SMART_DROP } from "./smart-drop.js";
 import { INFO } from "./info.js";
 
 // Per-capability typed action objects. Type-only — no runtime coupling. These feed the
@@ -117,8 +119,11 @@ import type { VacuumCleanActions } from "./vacuum-clean.js";
 import type { VacuumDockActions } from "./vacuum-dock.js";
 import type { DisplayActions } from "./display.js";
 import type { SuctionActions } from "./suction.js";
+import type { MowerActions } from "./mower.js";
 import type { LocateActions } from "./locate.js";
+import type { SmartDropActions } from "./smart-drop.js";
 import type { DeviceInfo } from "./info.js";
+import type { CusPushAlarmType } from "../push-events.js";
 
 /** Every capability module, in a stable order (governs `mergeProperties`/`buildCommand` precedence). */
 const MODULES: CapabilityModule[] = [
@@ -146,7 +151,9 @@ const MODULES: CapabilityModule[] = [
   VACUUM_CLEAN,
   VACUUM_DOCK,
   SUCTION,
+  MOWER,
   LOCATE,
+  SMART_DROP,
   DISPLAY,
   INFO,
 ];
@@ -687,8 +694,11 @@ export interface DeviceEventMap {
    * can be known about a value nothing pushes.
    */
   cameraEnabledChanged: PushSemanticEvent;
-  /** Station alarm lifecycle; `phase` says whether it fired or is counting down. */
-  alarm: PushSemanticEvent & { phase?: "triggered" | "delayed" };
+  /**
+   * Station alarm lifecycle; `phase` says whether it fired, is counting down, or was stopped. `type` is
+   * the push's alarm source or stop reason, absent when the push carried none.
+   */
+  alarm: PushSemanticEvent & { phase?: "triggered" | "delayed" | "stopped"; type?: CusPushAlarmType };
   /** Lock (un)locked or a lock alarm fired. */
   lockState: PushSemanticEvent;
   /**
@@ -795,7 +805,7 @@ export interface DeviceActionMap {
   smoke: SmokeActions;
   /** CO-detector reads (read-only): `coDetected`, `lastSeen`. */
   co: CoActions;
-  /** Security-keypad reads (read-only): `rssi`. */
+  /** Security-keypad reads (read-only): `charging`, `rssi`. */
   keypad: KeypadActions;
   /** RTSP publish for a NAS/NVR: `publish`/`withdraw` + `published`, `requireAuth`/`allowAnonymous`, `recordingMode`/`setRecordingMode`. One camera at a time per station. */
   rtsp: RtspActions;
@@ -805,8 +815,12 @@ export interface DeviceActionMap {
   vacuumDock: VacuumDockActions;
   /** RoboVac suction: `level`, `boostIq`, `supportedLevels`; `setSuctionLevel`, `setBoostIq`. */
   suction: SuctionActions;
+  /** Robot mower (read-only): `battery`, `cutHeight`, `network`, `wifiSignal`, wear timers and settings. No write is captured. */
+  mower: MowerActions;
   /** RoboVac locate (find-robot beep): `locating`; `locate(on?)`. */
   locate: LocateActions;
+  /** SmartDrop parcel box: `openLid()`. */
+  smartDrop: SmartDropActions;
   /** Smart Display (read-only): `battery`. No display write is captured. */
   display: DisplayActions;
   /** Identity metadata (read-only): `{ manufacturer, model, serialNumber, name, deviceType?, firmwareVersion?, hardwareVersion? }`. */
@@ -1031,7 +1045,9 @@ export type {
   RtspActions,
   VacuumCleanActions,
   SuctionActions,
+  MowerActions,
   LocateActions,
+  SmartDropActions,
 };
 /**
  * The member table each `*Actions` type is DERIVED from (`LockActions = Surface<typeof LOCK_MEMBERS>`),
@@ -1057,10 +1073,12 @@ export { MOTION_MEMBERS } from "./motion.js";
 export { PTZ_MEMBERS } from "./ptz.js";
 export { RTSP_MEMBERS } from "./rtsp.js";
 export { SIREN_MEMBERS } from "./siren.js";
+export { SMART_DROP_MEMBERS } from "./smart-drop.js";
 export { SMART_LIGHT_MEMBERS } from "./smart-light.js";
 export { SMOKE_MEMBERS } from "./smoke.js";
 export { DISPLAY_MEMBERS, type DisplayActions } from "./display.js";
 export { SUCTION_MEMBERS } from "./suction.js";
+export { MOWER_MEMBERS } from "./mower.js";
 export { VACUUM_CLEAN_MEMBERS } from "./vacuum-clean.js";
 // The read-only identity metadata object returned by `dev.info()` — a public consumer type.
 export type { DeviceInfo } from "./info.js";

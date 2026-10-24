@@ -279,6 +279,80 @@ describe("EufyMega auto-realtime", () => {
     expect(errors).toContain(boom); // failure surfaced, not thrown
   });
 
+  it("retries a failed push bring-up with backoff and installs the client that connects", async () => {
+    vi.useFakeTimers();
+    try {
+      const c = makeClient({ mqtt: 0 });
+      const client = { close: vi.fn() };
+      const transient = new TypeError("fetch failed");
+      c.push.mockRejectedValueOnce(transient).mockRejectedValueOnce(transient).mockResolvedValueOnce(client);
+      const errors: unknown[] = [];
+      c.eufy.on("error", (e) => errors.push(e));
+
+      await expect((c.eufy as any).ensureRealtime()).resolves.toMatchObject({ state: "partial" });
+      expect((c.eufy as any).pushClient).toBeUndefined();
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(c.push).toHaveBeenCalledTimes(2);
+      expect((c.eufy as any).pushClient).toBeUndefined();
+
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(c.push).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(c.push).toHaveBeenCalledTimes(3);
+      expect((c.eufy as any).pushClient).toBe(client);
+      expect(errors).toEqual([transient, transient]);
+
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(c.push).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("cancels an armed push retry on disconnect", async () => {
+    vi.useFakeTimers();
+    try {
+      const c = makeClient({ mqtt: 0 });
+      c.push.mockRejectedValue(new TypeError("fetch failed"));
+      c.eufy.on("error", () => {});
+
+      await (c.eufy as any).ensureRealtime();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(c.push).toHaveBeenCalledTimes(2);
+
+      await c.eufy.disconnect();
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(c.push).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retries push when loading devices fails before push was started", async () => {
+    vi.useFakeTimers();
+    try {
+      const c = makeClient({ mqtt: 0 });
+      const client = { close: vi.fn() };
+      const transient = new TypeError("fetch failed");
+      (c.eufy as any).registry.list.mockReturnValue([]);
+      c.getDevices.mockRejectedValueOnce(transient);
+      c.push.mockResolvedValueOnce(client);
+      const errors: unknown[] = [];
+      c.eufy.on("error", (e) => errors.push(e));
+
+      await expect((c.eufy as any).ensureRealtime()).resolves.toMatchObject({ state: "partial" });
+      expect(c.push).not.toHaveBeenCalled();
+      expect(errors).toEqual([transient]);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(c.push).toHaveBeenCalledOnce();
+      expect((c.eufy as any).pushClient).toBe(client);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reports count-only partial readiness across all selected planes", async () => {
     const c = makeClient({ mqtt: 0 });
     const life = { sn: "life", category: "eufy_life" } as unknown as EufyDevice;
@@ -452,5 +526,48 @@ describe("EufyMega sessionExpired event", () => {
     // Only the plain error reaches `error`.
     expect(errors).toHaveLength(1);
     expect(errors[0]?.message).toBe("transient boom");
+  });
+
+  it("reads a Tuya-only roster's DPs from the cloud without bringing up the broker", async () => {
+    const c = makeClient({ mqtt: 1, category: "eufy_home_tuya" });
+    const errors: Error[] = [];
+    c.eufy.on("error", (e: Error) => errors.push(e));
+    const fetchDps = vi.spyOn((c.eufy as any).tuya, "fetchDps").mockResolvedValue({ 8: 37 });
+    const deliver = vi.spyOn((c.eufy as any).tuyaDpRouter, "deliver").mockImplementation(() => {});
+
+    const readiness = await (c.eufy as any).ensureRealtime();
+    await vi.waitFor(() => expect(deliver).toHaveBeenCalledWith("m0", { 8: 37 }));
+    expect(fetchDps).toHaveBeenCalledWith("m0");
+    expect(c.mqtt).not.toHaveBeenCalled();
+    expect(readiness.mqtt.required).toBe(0);
+    expect(errors).toEqual([]);
+  });
+
+  it("waits on a Tuya device's first report without bringing up the broker", async () => {
+    const eufy = new EufyMega({ email: "t@example.com", password: "x" });
+    const registry = (eufy as any).registry;
+    const dev = { sn: "T2266P0000000000", category: "eufy_home_tuya", realtime: "smqtt" };
+    (eufy as any).realtimeGeneration = { epoch: (eufy as any).realtimeEpoch };
+    vi.spyOn(registry, "hasRealtimeState").mockReturnValue(false);
+    vi.spyOn(registry, "list").mockReturnValue([dev]);
+    vi.spyOn(registry, "capabilitiesForDevice").mockReturnValue(new Set(["vacuum_clean"]));
+    const awaitState = vi.spyOn(registry, "awaitRealtimeState").mockResolvedValue(undefined);
+    const start = vi.spyOn(eufy as any, "ensureMqttStarted");
+
+    await (eufy as any).awaitFirstRealtimeState(dev.sn);
+    expect(start).not.toHaveBeenCalled();
+    expect(awaitState).toHaveBeenCalledWith(dev.sn, 4000);
+  });
+
+  it("registers a Tuya clean-line device under its serial when the record names no Tuya id", async () => {
+    const eufy = new EufyMega({ email: "t@example.com", password: "x" });
+    vi.spyOn((eufy as any).registry, "getDevices").mockResolvedValue([
+      { sn: "T2880P0000000000", category: "eufy_home_tuya", raw: {} },
+      { sn: "T2266P0000000000", category: "eufy_home_tuya", raw: { tuya_uuid: "tuya-dev-1" } },
+    ]);
+    const register = vi.spyOn((eufy as any).tuya, "registerDevice");
+    await eufy.getDevices();
+    expect(register).toHaveBeenCalledWith("T2880P0000000000", "T2880P0000000000");
+    expect(register).toHaveBeenCalledWith("T2266P0000000000", "tuya-dev-1");
   });
 });

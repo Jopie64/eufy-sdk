@@ -16,7 +16,8 @@ export const ACCOUNT_ID = "0000000000000000000000000000000000000000";
  *
  * Every one of them needs the same two answers before the router will send anything — connected, and
  * whether a level-2 key is available — and those two cannot be allowed to disagree: a fake that reports no
- * key while answering a wait for one with `true` tests a session that cannot exist. Building them together
+ * key while answering a wait for one with `true` tests a GCM-keyed session that cannot exist. (A real session
+ * holding only an RSA cipher's key does answer that way; the RSA specs drive a real session for it.) Building them together
  * here is what keeps the fakes honest and stops the next member added to the wait from having to be
  * remembered in every spec separately.
  *
@@ -104,6 +105,7 @@ export function routerWithSession(
         sn: DEVICE_SN,
         stationSn: STATION_SN,
         model: "T8114",
+        channel: 1,
         raw: { parent_sn: STATION_SN, device_channel: 1, member: { admin_user_id: accountId } },
       } as never,
       // The parent station, listed but endpoint-less: with nothing registered, a cold open fails at

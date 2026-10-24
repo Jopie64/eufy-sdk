@@ -68,6 +68,8 @@ export type ProductLine = "security" | "life" | "clean" | "print" | "display" | 
  * `p2p-frame` shape of {@link InboundSignal}.
  */
 export interface CapabilityFrame {
+  /** Cloud device type resolved from the reporting station/channel. */
+  deviceType?: number;
   stationSn: string;
   commandId: number;
   channel: number;
@@ -259,9 +261,17 @@ export interface AvailabilityContext {
   homeBaseAttached?: boolean;
   /** Serial of the covering station, when the device record names one. */
   stationSerial?: string;
+  /**
+   * The vendor DeviceType of the station the device hangs off, when it is attached
+   * and the station's record states one. Answers which station family a command addressed to an
+   * attached device is carried through.
+   */
+  stationDeviceType?: number;
 }
 
 export interface CommandContext extends AvailabilityContext {
+  /** Vendor-formatted timezone reported by the station; never inferred from the host. */
+  timezone?: string;
   /** Device channel (0 for standalone, `device_channel` on a HomeBase). */
   channel: number;
   /** eufy DeviceType, when known. */

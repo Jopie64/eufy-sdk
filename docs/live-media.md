@@ -16,7 +16,7 @@ also requires snapshot capability evidence and the stored-image cache described 
 
 ## One pull, many consumers
 
-Every consumer of a given camera shares **one** underlying media session (one live pull), fanned out
+Every consumer of a given camera and optical view shares **one** underlying media session (one live pull), fanned out
 to all of them. `cam.live()` twice, a `snapshotLive()` while a `recordFragments()` runs, a
 `openReadable()` alongside a `live()` — all attach to the **same** shared source. There is exactly one
 start on the wire regardless of how many consumers attach.
@@ -25,8 +25,9 @@ Consequences a host should rely on:
 
 - **Cheap re-use.** The motion-thumbnail → tap-to-watch flow attaches a snapshot then a live view
   within seconds; the second attach re-uses the warm session, no second pull.
-- **Late joiners are primed instantly.** The last keyframe (IDR) is cached and replayed to a new
-  consumer on attach — no waiting a full GOP for the next keyframe before the picture appears.
+- **Late joiners wait for a live keyframe.** After video subscription, delivery starts at the next
+  keyframe and continues with its dependent pictures. A cached keyframe alone cannot supply the
+  intervening references.
 - **Linger, then stop.** When the last consumer detaches the source lingers briefly (so a quick
   re-attach reuses it) and then stops the pull. You don't manage the pull; you manage your consumer.
 
@@ -56,6 +57,31 @@ Worth knowing:
 - `record()` opens its own pull instead of joining the shared source, so it costs a second stream on a
   camera that is already streaming. `recordFragments()` is a shared consumer like everything else.
 
+## T8N00 PoE cameras
+
+T8E00 and T8P00 cameras attached to a T8N00 support `live()`, `openReadable()` and
+`snapshotLive()`. `live()` delivers H.265 video and AAC-LC or G.711 A-law audio;
+`openReadable()` provides video, and `snapshotLive()` captures a fresh still.
+Recording and talkback are not implemented for this route.
+
+`cam.views?.()` reports the optical view identifiers supported by this route: `[0, 1]`
+for the dual-lens T8E00 S4 and `[0]` for the T8P00 E40. On the S4, view `0` is fixed
+and view `1` is movable. Omitting `view` selects `0`.
+
+```ts
+const views = cam?.views?.();
+const fixed = await cam?.live?.({ view: 0 });
+const movable = await cam?.live?.({ view: 1 });
+fixed?.stop();
+movable?.stop();
+```
+
+`live`, `openReadable` and `snapshotLive` accept the same `view` option. Different
+views own independent calls; repeated consumers of one view share its source.
+Stopping one view leaves the other running. An unsupported view rejects with
+`RangeError` before connecting. A secondary-view live snapshot failure propagates
+without substituting a stored thumbnail, whose optical view is unknown.
+
 ## 1. Event stream (low-level)
 
 The direct escape hatch — raw frames as they arrive.
@@ -72,8 +98,12 @@ stream.on("video", (frame) => {
   // frame.width, frame.height  what the station's frame header reported (see below — these change
   //                            within a session; `video-config` is the authority)
   // frame.keyframe  true on an IDR (a valid resync/segment boundary)
+  // frame.sourceTimestamp  optional source-reported u32 timestamp; unit/clock origin unspecified
 });
 stream.on("audio", (frame) => {
+  // frame.codec   "aac-lc" | "aac-eld" | "g711a"
+  // frame.data    one ADTS frame (aac-lc), one raw access unit (aac-eld), raw A-law samples (g711a)
+  // frame.config  the AudioSpecificConfig that decodes frame.data — present for aac-eld only
   consumeAudio(frame.codec, frame.data);
 });
 stream.on("video-config", (config) => {
@@ -89,6 +119,17 @@ stream.stop(); // detach this consumer
 
 `stream.stop()` detaches **this** consumer only. The shared pull stops when the _last_ consumer
 detaches (after the linger window).
+
+### Source timing and delivery timing
+
+P2P video events preserve the source header's unsigned 32-bit `sourceTimestamp`.
+Object-mode `openReadable({ objectMode: true })` preserves the same frame metadata;
+byte-mode `openReadable()` returns only video bytes.
+
+The field carries the source value unchanged. Its unit, clock origin and relation to
+capture/presentation time are unspecified; it is not an absolute timestamp or a
+cross-camera synchronization clock. The unsigned 32-bit value can wrap, and its
+clock can reset when the source session changes.
 
 ### The source reconfigures mid-session
 
@@ -129,8 +170,8 @@ first announcements of a session can move from the header's answer to the parame
 having reconfigured; a caller that rebuilds on a difference rebuilds once there.
 
 The announcement is per consumer, against what **that** consumer was last given. A consumer joining
-mid-session is primed with a cached keyframe it did not witness arriving, and one that crosses its queue
-bound resynchronises onto a later IDR having skipped the frame the change arrived on — so both are told,
+mid-session starts at its next live keyframe, and one that crosses its queue bound resynchronises onto
+a later IDR having skipped the frame the change arrived on — so both are told,
 even though the shared source saw the change once.
 
 A change arriving on a keyframe carrying fresh parameter sets is what every run but one showed, and that
@@ -162,9 +203,13 @@ and carried on the delta frames that follow, so every frame carries one even tho
 config to sniff. **Audio** `codec` is declared by the station in each frame's header, so it is read
 rather than inferred — and read on every frame, because the device is free to change it mid-stream.
 
-Audio deliberately carries **no sample rate and no channel count**: neither is on the wire. The eufy app
-assumes 16 kHz mono for all three codecs, and a host that needs those numbers is making the same
-assumption — the SDK does not dress it up as a device fact.
+Audio carries **no sample rate and no channel count** of its own: neither is on the wire. The eufy app
+assumes 16 kHz mono for all three codecs, and a host that needs those numbers for `aac-lc` or `g711a` is
+making the same assumption. An ADTS frame states its own parameters in its header; A-law states nothing.
+
+An `aac-eld` frame is the exception, because its framing describes nothing at all: the station sends a raw
+access unit with no transport header. Such a frame carries `config`, the AudioSpecificConfig that decodes
+it — ER AAC-ELD, 16 kHz, mono, 480-sample frames, without LD-SBR.
 
 A `video` event is **one whole access unit**. A station serves a unit bigger than its own chunk size as
 several frames, and those are rejoined before you see them — so `keyframe` really does mean "you may
@@ -209,8 +254,9 @@ for await (const frag of recording) {
 ```
 
 Both H.264 (`avc1`/`avcC`) and H.265 (`hvc1`/`hvcC`) are handled; Annex-B start codes are converted to
-AVCC length-prefixed NALs in the `mdat`. AAC-LC and AAC-ELD sources add an `mp4a`/`esds` audio track,
-with ADTS framing removed from each media sample. G.711 A-law remains available through `live()` and
+AVCC length-prefixed NALs in the `mdat`. AAC-LC and AAC-ELD sources add an `mp4a`/`esds` audio track:
+an AAC-LC sample has its ADTS framing removed, and an AAC-ELD sample is the raw access unit the station
+sent, described by the frame's `config` in `esds`. G.711 A-law remains available through `live()` and
 is not mislabeled as MPEG-4 AAC in the container.
 
 The loop paces itself: a fragment is a complete ordered unit, so a caller that falls far enough behind holds
@@ -317,12 +363,10 @@ const shot = await cam.snapshotLive?.(); // { jpeg, width, height }
 the stream's frame header, so they cannot disagree with the bytes. (Some cameras reconfigure resolution
 inside one short burst, which is exactly when the header and the encoded still part company.)
 
-If the shared source already has a cached keyframe (a live view or another consumer is warm),
-`snapshotLive` decodes that keyframe directly — **no second pull**. Only if nothing is warm does it
-briefly attach, wait for a clean keyframe, decode, and detach. (The JPEG decode itself uses ffmpeg as
-an optional convenience sink — resolved on `PATH`, or set `ffmpegPath` on the client to name the binary
-you ship; the raw keyframe bytes are always available dependency-free via `openReadable` / the event
-stream.)
+`snapshotLive` reuses a warm pull without opening a second session. It waits for live keyframes,
+collects its decode burst, and detaches before decoding. The JPEG decode uses ffmpeg as an optional
+convenience sink, resolved on `PATH` or configured with `ffmpegPath`. Raw frames remain available
+through `openReadable` and the event stream.
 
 ## Recordings stored on a HomeBase 2
 
@@ -367,9 +411,19 @@ recording.
 present only on a camera that reported a speaker, so guard it like the other optional media methods
 (the snippets below assert it once with `!` rather than repeating the guard on each line).
 
-Audio must be **AAC-LC, 16 kHz, mono, in ADTS frames** — the device's path is fixed at those
-parameters, so anything else is rejected rather than resampled (it would play at the wrong pitch and
-speed). Chunk boundaries don't matter; frames are recovered from the stream.
+The handle says which codec the speaker plays: `talk.codec`. It is `aac-eld` on a T8410C that
+sends `aac-eld`, and `aac-lc` on every other camera, including another model that sends
+`aac-eld`, whose speaker codec is not evidenced.
+
+- `aac-lc`: **AAC-LC, 16 kHz, mono, in ADTS frames**, through `write()` / `writable()`. Chunk
+  boundaries don't matter; frames are recovered from the stream.
+- `aac-eld`: one raw AAC-ELD access unit with LD-SBR (16 kHz, mono, 512 samples) per `write()`, or
+  per write to `writable()`, which is object-mode for this codec. A T8410C that sends `aac-eld`
+  does not play `aac-lc`.
+
+An `aac-lc` stream at another rate or channel count is rejected with an `error` rather than
+resampled (it would play at the wrong pitch and speed, or not at all). An `aac-eld` unit longer
+than the device accepts is refused with an `error`.
 
 ```ts
 const talk = await cam?.talkback?.();
@@ -378,6 +432,15 @@ if (!talk) return; // this camera has no two-way audio
 talk.on("error", (err) => console.error(err.message));
 talk.on("finished", () => void talk.stop());
 fs.createReadStream("greeting.aac").pipe(talk.writable());
+```
+
+For a camera whose speaker plays `aac-eld`, write access units instead:
+
+<!-- typecheck: host accessUnit -->
+
+```ts
+const talk = await cam?.talkback?.();
+if (talk?.codec === "aac-eld") talk.write(accessUnit);
 ```
 
 Producing a suitable file with ffmpeg:
@@ -391,17 +454,17 @@ about 32 kbps an encoder will occasionally emit one that exceeds it; those frame
 `error` rather than sent, so a higher bitrate quietly costs you audio instead of buying quality. The
 path is 16 kHz mono speech — there is nothing above 32 kbps to gain.
 
-Frames are **paced** at their own playback rate (64 ms each) rather than flushed as fast as they
-arrive, so piping a file plays it at speed instead of overrunning the device. `talk.pending` reports
-what is still waiting, and `writable()` applies backpressure at the queue's high-water mark, so a fast
-source cannot buffer a whole clip in memory. A realtime source (a live mic) simply keeps the queue
-near-empty and never hits that mark.
+Frames are **paced** at their own playback rate (64 ms for `aac-lc`, 32 ms for `aac-eld`) rather
+than flushed as fast as they arrive, so piping a file plays it at speed instead of overrunning the
+device. `talk.pending` reports what is still waiting, and `writable()` applies backpressure at the
+queue's high-water mark, so a fast source cannot buffer a whole clip in memory. A realtime source (a
+live mic) simply keeps the queue near-empty and never hits that mark.
 
 `finished` is the completion signal: it fires once, when the input has ended **and** everything queued
 has reached the wire. Ending the input is what `writable()`'s `final` does for you; an imperative
 `write()` caller calls `talk.end()` instead. Note that `finished` deliberately does not mean "the queue
 is momentarily empty" — a realtime source empties the queue after every single frame, so stopping on
-that would cut the clip to 64 ms.
+that would cut the clip to one frame.
 
 `stop()` closes the path and **drops** anything still queued — wait for `finished` if you want the clip
 played out. A talkback that goes quiet (nothing written, nothing queued) closes itself after 30 s, so a

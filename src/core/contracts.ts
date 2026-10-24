@@ -217,9 +217,10 @@ export class RecordingDownloadError extends Error {
  * A recording downloaded from the station, as elementary streams.
  *
  * `video` is Annex-B H.264 in decode order, `audio` AAC-LC 16 kHz mono in ADTS framing (absent when the
- * recording carried none that could be decoded). `frames` counts the distinct video frames received,
- * `missingFrames` the ones the camera numbered but that never arrived, and `durationMs` spans the first
- * to the last received frame by the camera's own timestamps; `fps` is derived from those two stamps.
+ * recording carried none that could be decoded). `frames` counts the distinct video sequences emitted.
+ * `missingFrames` counts gaps between received sequences and received sequences that yielded no usable
+ * picture, including at either end. `durationMs` spans the first to the last emitted picture by the
+ * camera's own timestamps; `fps` is derived from those stamps.
  */
 export interface RecordingDownload {
   video: Buffer;
@@ -293,7 +294,7 @@ export interface StateConvergenceFailure {
   property: string;
   param: number;
   /** The RAW param value the write asked the device to report. */
-  expected?: boolean | number | string;
+  expected: boolean | number | string;
   /** What the param actually read when the deadline passed, absent where the device reported none at all. */
   observed?: boolean | number | string;
   timeoutMs: number;
@@ -312,7 +313,7 @@ export class StateConvergenceError extends Error {
   readonly sn: string;
   readonly property: string;
   readonly param: number;
-  readonly expected?: boolean | number | string;
+  readonly expected: boolean | number | string;
   readonly observed?: boolean | number | string;
   readonly timeoutMs: number;
 
@@ -342,10 +343,11 @@ export class StateConvergenceError extends Error {
 export type ScalarForm = "auto" | "int-string" | "direct-binary";
 
 /**
- * The identity fields the `ff09` frame is built from — the AES key/IV inputs (`adminUserId`/`deviceSn`)
- * plus the frame's own direction bit and user-attribution fields (`A3`/`A4`/`A5`). Shared by the
- * actuate intent; the settings intents carry a narrower subset (the GET/SET frames omit the
- * user-attribution fields).
+ * The identity fields an actuation frame is built from — for `ff09`, the AES key/IV inputs
+ * (`adminUserId`/`deviceSn`) plus the frame's own direction bit and user-attribution fields
+ * (`A3`/`A4`/`A5`); for the keyed-payload envelope, the same five fields, sealed into its inner JSON.
+ * Shared by both actuate intents; the `ff09` settings intents carry a narrower subset (the GET/SET frames
+ * omit the user-attribution fields).
  */
 export interface Ff09Identity {
   /** Actuation direction: `true` = engage (lock / close), `false` = release (unlock / open) — the frame's `A3` byte. */
@@ -402,12 +404,23 @@ export type Command =
       channel: number;
       mValue3?: number;
       form?: ScalarForm;
+      /**
+       * `"set-payload"`: a level-2 key that seals only this envelope (an RSA cipher's AES-128-ECB key)
+       * may seal it. Absent, the send waits for the key every level-2 sender uses.
+       */
+      level2Sender?: "set-payload";
     }
   | { kind: "p2p-privacy-burst"; enabled: boolean; channel: number }
   | { kind: "p2p-station-scalar"; cmd: number; value: number; channel: number }
   /** P2P int-plus-string frame; the transport injects the authenticated account id string. */
   | { kind: "p2p-int-string"; cmd: number; value: number; valueSub: number; channel: number }
   | ({ kind: "ff09-actuate" } & Ff09Identity)
+  /**
+   * `keyed-payload-actuate` — a `SET_PAYLOAD` envelope whose inner JSON is sealed with a fresh AES key
+   * that the envelope itself carries, wrapped for the device's own public key. P2P-only; the router
+   * resolves the device key and the member display name from the device record.
+   */
+  | ({ kind: "keyed-payload-actuate" } & Ff09Identity)
   | { kind: "ff09-autolock"; adminUserId: string; deviceSn: string; enabled: boolean; delaySeconds?: number }
   | { kind: "ff09-setting-toggle"; adminUserId: string; deviceSn: string; settingId: number; value: boolean }
   // `mqtt-dp` — an `eufy_life` secure-MQTT "DP" TLV write (smart lights + kin). The capability supplies
@@ -503,7 +516,7 @@ export interface CommandSink {
 }
 
 /**
- * Inbound Tuya DP event contract — the transport parses a ThingClips MQTT payload
+ * Inbound Tuya DP event contract — the transport parses the Tuya cloud DP read
  * (string-keyed object → numeric-keyed record) and delivers it through this interface. The
  * transport owns the parse; a capability owns the semantics (which DP id means what). Mirrors
  * {@link DpInboundFrame} for the AIoT MQTT path; the capability layer never names the Tuya framing.
@@ -535,6 +548,8 @@ export type VideoCodec = "h264" | "h265" | "av1";
  * headers promise decodes to no picture at all.
  */
 export interface LiveVideoFrame {
+  /** Source-reported unsigned 32-bit timestamp; unit and clock origin are unspecified. */
+  sourceTimestamp?: number;
   /** True on an IDR — a unit a consumer may begin decoding at, never a continuation of an earlier one. */
   keyframe: boolean;
   /**
@@ -591,6 +606,13 @@ export interface LiveVideoConfig {
   height: number;
 }
 
+/** Video frame paired with its original SDK source-arrival time. */
+export interface ReceivedVideoFrame {
+  readonly frame: LiveVideoFrame;
+  /** Wall-clock milliseconds when the shared source received the frame; preserved on replay. */
+  readonly timestampMs: number;
+}
+
 /**
  * Elementary-stream audio codec of a {@link LiveAudioFrame}. The station declares it per frame as a
  * byte in the `CMD_AUDIO_FRAME` header — unlike video, nothing is sniffed. These are the three values
@@ -599,19 +621,33 @@ export interface LiveVideoConfig {
  */
 export type AudioCodec = "aac-lc" | "aac-eld" | "g711a";
 
+/** The codec a camera's speaker plays: `aac-eld` on a camera whose speaker plays it, `aac-lc` otherwise. */
+export type TalkbackCodec = Extract<AudioCodec, "aac-lc" | "aac-eld">;
+
 /**
  * One audio access unit, carrying the codec the station declared for it.
  *
- * Sample rate and channel count are deliberately absent: they are not on the wire. The v6 app assumes
- * 16 kHz mono for every audio type rather than reading them, so the SDK does not invent fields the
- * device never sent.
+ * Sample rate and channel count are absent for `aac-lc` and `g711a`: they are not on the wire, and the v6 app
+ * assumes 16 kHz mono for every audio type rather than reading them. An `aac-lc` frame is one ADTS frame and
+ * `g711a` is raw A-law. An `aac-eld` frame is one raw access unit with no transport framing, so it carries the
+ * AudioSpecificConfig that decodes it.
  */
-export interface LiveAudioFrame {
-  /** Codec declared in the frame header. */
-  codec: AudioCodec;
-  /** Elementary-stream bytes (ADTS-framed for the two AAC profiles). */
-  data: Buffer;
-}
+export type LiveAudioFrame =
+  | {
+      /** Codec declared in the frame header. */
+      codec: "aac-lc" | "g711a";
+      /** One ADTS frame for `aac-lc`, raw A-law samples for `g711a`. */
+      data: Buffer;
+      config?: undefined;
+    }
+  | {
+      /** Codec declared in the frame header. */
+      codec: "aac-eld";
+      /** One raw AAC-ELD access unit. */
+      data: Buffer;
+      /** AudioSpecificConfig (ISO/IEC 14496-3) that decodes `data`. */
+      config: Buffer;
+    };
 
 /**
  * One fragmented-MP4 (CMAF) output unit from the native muxer. `init` (the `ftyp`+`moov` init
@@ -711,10 +747,9 @@ export interface LiveStreamConsumer extends LiveStreamHandle {
    * consumer receives, so a consumer holding media it has not been told the configuration of is not a state
    * it can reach.
    *
-   * Per consumer, against what THIS consumer was last given: a consumer that joins mid-session is primed
-   * with a cached keyframe it did not witness arriving, and one that crosses its bound resynchronises onto
-   * a later IDR having skipped the frame the source saw the change on. Announcing what the source saw
-   * would leave both holding an encoder built for media they never received.
+   * Per consumer, against what this consumer was last given: a mid-session join begins at its next live
+   * keyframe, and a consumer crossing its queue bound resynchronises onto a later IDR. Each receives
+   * the configuration of the media it is delivered, even when another consumer has already seen it.
    *
    * Only a consumer announces this, never a bare {@link LiveStreamHandle}: it is read from the parameter
    * sets a shared source watches every frame for, which the raw pull underneath it does not do. That is
@@ -767,6 +802,11 @@ export interface AbortableCall {
   signal?: AbortSignal;
 }
 
+/** Select an optical view; absence selects view 0. */
+export interface MediaSourceSelection {
+  view?: number;
+}
+
 export interface SharedSourceHints {
   /**
    * Power source, a runtime device fact (`"battery"` incl. solar, or `"wired"`) — never a device-family
@@ -793,6 +833,8 @@ export interface SharedSourceHints {
  * because an unbound model has no live client (hence `?.` at the call site).
  */
 export interface MediaProvider {
+  /** Optical view identifiers supported by this bound media route. */
+  views?: readonly number[];
   /**
    * Return the latest validated push thumbnail retained in memory. This passive operation performs no
    * network, storage, P2P, live-media, or transcoding work at call time. It rejects with
@@ -821,7 +863,8 @@ export interface MediaProvider {
       collectMs?: number;
       skipKeyframes?: number;
     } & SharedSourceHints &
-      AbortableCall,
+      AbortableCall &
+      MediaSourceSelection,
   ): Promise<{
     jpeg: Buffer;
     width: number;
@@ -854,7 +897,9 @@ export interface MediaProvider {
    * stream?.stop(); // detach this consumer
    * ```
    */
-  live(opts?: SharedSourceHints & AbortableCall & Record<string, unknown>): Promise<LiveStreamConsumer>;
+  live(
+    opts?: SharedSourceHints & AbortableCall & MediaSourceSelection & Record<string, unknown>,
+  ): Promise<LiveStreamConsumer>;
   /**
    * Record `seconds` of video → an mp4/h264 buffer.
    *
@@ -868,12 +913,14 @@ export interface MediaProvider {
   record(seconds: number, opts?: { timeoutMs?: number; skipKeyframes?: number }): Promise<Buffer>;
   /**
    * Open a video-only `node:stream` Readable over a shared source consumer — raw Annex-B bytes
-   * (default) or `objectMode` {@link LiveVideoFrame}s. Audio is available separately through
-   * {@link live} or muxed through {@link recordFragments}; it is never interleaved into raw video.
-   * The caller owns the Readable's lifetime, and destroying it releases the shared pull.
+   * (default) or `objectMode` {@link LiveVideoFrame}s. With objectMode and arrivalTime, it yields
+   * {@link ReceivedVideoFrame} envelopes whose original source-arrival time survives retained replay.
+   * Raw mode ignores arrivalTime. Audio is available separately through {@link live} or muxed through
+   * {@link recordFragments}; it is never interleaved into raw video. The caller owns the Readable's
+   * lifetime, and destroying it releases the shared pull.
    */
   openReadable?(
-    opts?: { objectMode?: boolean } & SharedSourceHints & AbortableCall,
+    opts?: { objectMode?: boolean; arrivalTime?: boolean } & SharedSourceHints & AbortableCall & MediaSourceSelection,
   ): Promise<import("node:stream").Readable>;
   /**
    * Continuously record the live feed as fragmented-MP4 (CMAF). The caller-owned
@@ -906,7 +953,10 @@ export interface MediaProvider {
    * sub-command id and the reply shape (e.g. the doorbell's 6237 quick-response list).
    * @internal
    */
-  p2pQuery?(subCmd: number, opts?: { timeoutMs?: number }): Promise<Record<string, unknown>>;
+  p2pQuery?(
+    subCmd: number,
+    opts?: { timeoutMs?: number; payload?: Record<string, unknown> },
+  ): Promise<Record<string, unknown>>;
   /**
    * Generic control-payload request/reply query: send a `CONTROL_PAYLOAD` (1700) `{commandType,data}`
    * and resolve with the correlated notify (`1351`) frame's `payload`. Distinct from {@link p2pQuery}'s
@@ -922,10 +972,11 @@ export interface MediaProvider {
 }
 
 /**
- * An encoder that turns raw PCM into AAC-LC frames, supplied by the CALLER. The SDK ships none: the
- * device's audio path is fixed at AAC-LC 16 kHz mono, and every plausible encoder is either a native
+ * An encoder that turns raw PCM into AAC-LC frames, supplied by the CALLER. The SDK ships none: an
+ * `aac-lc` speaker plays AAC-LC 16 kHz mono, and every plausible encoder is either a native
  * dependency or an external process, both of which belong to the host rather than to a protocol SDK.
- * It is unnecessary where the audio is already AAC — see {@link TalkbackHandle}.
+ * It is unnecessary where the audio is already AAC — see {@link TalkbackHandle}. A camera whose speaker
+ * plays `aac-eld` refuses an encoder: a talkback opened with one is rejected before the speaker path opens.
  *
  * `encode` receives 16-bit little-endian mono PCM at 16 kHz and returns whole ADTS frames, zero or
  * more per call (an encoder buffers until it has a full 1024-sample block). `flush` drains a partial
@@ -941,17 +992,19 @@ export interface AacEncoder {
  * A live talkback session: audio pushed from the host to a camera's speaker, the mirror of
  * {@link LiveStreamHandle}'s inbound feed.
  *
- * Audio must be **AAC-LC, 16 kHz, mono, in ADTS frames** — what the device's path is fixed at, so a
- * stream at another rate or channel count is rejected rather than resampled (it would otherwise play
- * at the wrong pitch and speed). Feed it either way:
+ * Audio must be in the codec the camera's speaker plays, {@link TalkbackHandle.codec}:
  *
- *  - **ADTS AAC** — the default. Chunk boundaries are irrelevant; frames are recovered from the
- *    stream, so piping an encoder's output straight in works.
- *  - **PCM** — only when the handle was opened with an {@link AacEncoder}, which then does the
- *    conversion. `write` takes 16-bit little-endian mono PCM at 16 kHz instead.
+ *  - **`aac-lc`:** AAC-LC, 16 kHz, mono, in ADTS frames, through `write` / `writable()`. Chunk boundaries are
+ *    irrelevant; frames are recovered from the stream. With an {@link AacEncoder}, `write` takes 16-bit
+ *    little-endian mono PCM at 16 kHz instead.
+ *  - **`aac-eld`:** one raw AAC-ELD access unit with LD-SBR (16 kHz, mono, 512 samples) per `write`, or per
+ *    object-mode `writable()` write. No encoder applies.
  *
- * Frames are **paced** at their own playback rate (64 ms each) rather than flushed as fast as they
- * arrive, so feeding a file plays it at speed instead of overrunning the device. A live source keeps
+ * An `aac-lc` stream at another rate or channel count is rejected rather than resampled. An `aac-eld` unit longer
+ * than the device accepts is refused with an `error`.
+ *
+ * Frames are **paced** at their own playback rate (64 ms for `aac-lc`, 32 ms for `aac-eld`) rather than flushed as
+ * fast as they arrive, so feeding a file plays it at speed instead of overrunning the device. A live source keeps
  * the queue near-empty and is unaffected.
  *
  * @example
@@ -963,7 +1016,16 @@ export interface AacEncoder {
  * ```
  */
 export interface TalkbackHandle {
-  /** Queue audio — ADTS frames, or PCM when an encoder was supplied. Partial frames are held. */
+  /**
+   * The codec this camera's speaker plays: `aac-eld` on a camera whose speaker plays it and whose stream on the same
+   * media session carries `aac-eld`, `aac-lc` otherwise, including when that stream carries no audio. It decides
+   * what {@link write} and {@link writable} take.
+   */
+  readonly codec: TalkbackCodec;
+  /**
+   * Queue audio: ADTS frames or PCM for `aac-lc`, one access unit per call for `aac-eld`. Partial ADTS frames are
+   * held.
+   */
   write(chunk: Buffer): void;
   /**
    * A `node:stream` Writable over {@link write}, for piping a file or an encoder's stdout. Applies
@@ -986,7 +1048,7 @@ export interface TalkbackHandle {
    *
    * This deliberately does NOT fire on a merely-empty queue. A realtime source keeps the queue near
    * empty by design, so "queue is empty" arrives after the very first frame and stopping on it would
-   * cut the clip to 64 ms. {@link pending} is the instantaneous depth.
+   * cut the clip to one frame. {@link pending} is the instantaneous depth.
    */
   on(event: "finished", listener: () => void): this;
   /**

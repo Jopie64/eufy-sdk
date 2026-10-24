@@ -17,8 +17,7 @@
  *
  * Per consumer: a bounded queue with **drop-to-keyframe** backpressure — a slow consumer that
  * overflows drops its backlog and resyncs at the next IDR, never stalling upstream or its peers.
- * On `attach()` the last cached keyframe is replayed (keyframe-prime) so a new consumer decodes
- * immediately instead of waiting a full GOP.
+ * An ordinary `attach()` begins at the next live keyframe, preserving its dependent-picture chain.
  *
  * Transport-only: speaks {@link LiveStreamHandle} + {@link LiveVideoFrame}, never a capability.
  *
@@ -142,12 +141,13 @@ export interface SharedLiveSourceOptions {
    */
   onStopped?: () => void;
   /**
-   * A media start was abandoned unacknowledged before anything was delivered, so this session is not being
-   * heard. The owner is asked for a replacement and calls {@link SharedLiveSource.rewarm} once it has one.
+   * This session is not serving the warm-up: a media start was abandoned unacknowledged, or forced starts went
+   * unanswered by any media, before anything was delivered. The owner answers whether it is replacing the
+   * session, and calls {@link SharedLiveSource.rewarm} once it has the replacement.
    *
-   * Asked at most once per warm-up: further abandonments are the same session saying the same thing.
+   * Asked at most once per warm-up: further evidence is the same session saying the same thing.
    */
-  onSessionUnreachable?: () => void;
+  onSessionUnreachable?: () => boolean;
 }
 
 /**
@@ -155,7 +155,6 @@ export interface SharedLiveSourceOptions {
  * back directly), plus the listener removal and arrival-timed feed the recording and readable egresses use.
  */
 export interface Consumer extends LiveStreamConsumer {
-  /** What this consumer holds the pull for. */
   /** Detach a previously registered listener (mirrors {@link LiveStreamHandle.on}). */
   off(event: "video", listener: (frame: LiveVideoFrame) => void): this;
   off(event: "audio", listener: (frame: LiveAudioFrame) => void): this;
@@ -163,8 +162,6 @@ export interface Consumer extends LiveStreamConsumer {
   off(event: "error", listener: (err: Error) => void): this;
   /** Subscribe to frames carrying the source-captured arrival time used by the prebuffer. */
   onMedia(listener: (item: TimedMediaFrame) => void): this;
-  /** True once the source has replayed a cached keyframe to this consumer (no GOP wait on join). */
-  readonly primed: boolean;
   /** Leave the source (refcount--). Idempotent. `stop()` is an alias (LiveStreamHandle). */
   detach(): void;
 }
@@ -172,10 +169,8 @@ export interface Consumer extends LiveStreamConsumer {
 /**
  * One media frame retained with its transport-arrival time for prebuffer continuity.
  *
- * A video frame carries the coded configuration in force when it ARRIVED, because the item outlives that
- * moment: it is the unit a keyframe-prime replays to a consumer that joined later and the unit a prebuffer
- * drain hands over, and both have to announce the configuration their media was coded under rather than
- * whichever one is current by the time they are delivered.
+ * A video frame carries the coded configuration in force when it arrived, so a prebuffer drain
+ * announces the configuration its retained media was coded under.
  */
 export type TimedMediaFrame =
   | { kind: "video"; frame: LiveVideoFrame; timestampMs: number; config: LiveVideoConfig }
@@ -186,35 +181,24 @@ class ConsumerImpl extends EventEmitter implements Consumer {
   private queue: TimedMediaFrame[] = [];
   private paused = false;
   private detached = false;
-  primed = false;
   awaitingKeyframe = false;
   /** The last coded configuration announced to THIS consumer — see {@link flush}. */
   private config?: LiveVideoConfig;
-  /** Cached keyframe to replay, held until a "video" listener actually subscribes (see below). */
-  private pendingPrime?: Extract<TimedMediaFrame, { kind: "video" }>;
-
+  /** Re-arm an ordinary join when its first video-bearing subscription starts, including after an async gap. */
   constructor(
     private readonly onDetach: (c: ConsumerImpl) => void,
     private readonly maxQueue: number,
+    waitForKeyframe: boolean,
   ) {
     super();
-    // Deliver the keyframe-prime only once someone is listening. `live()` is async, so a naive
-    // microtask replay would fire the cached IDR before the caller attaches its "video" handler and
-    // it would be lost. "newListener" fires just BEFORE the first video listener is added, so a
-    // microtask from here lands right after that listener is in place — the join is decodable.
-    this.on("newListener", (event) => {
-      if (event !== "video" || this.listenerCount("video") !== 0) return;
-      const kf = this.pendingPrime;
-      if (!kf) return;
-      this.pendingPrime = undefined;
-      queueMicrotask(() => this.deliverVideo(kf));
-    });
-  }
-
-  /** Stage a keyframe to replay when the first video listener subscribes. */
-  prime(item: Extract<TimedMediaFrame, { kind: "video" }>): void {
-    this.primed = true;
-    this.pendingPrime = item;
+    if (waitForKeyframe) {
+      this.on("newListener", (event) => {
+        if (event !== "video" && event !== "media") return;
+        if (this.listenerCount("video") > 0 || this.listenerCount("media") > 0) return;
+        this.awaitingKeyframe = true;
+        this.config = undefined;
+      });
+    }
   }
 
   /** Attached-by-construction — `start()` is a no-op so a Consumer satisfies LiveStreamHandle. */
@@ -269,14 +253,7 @@ class ConsumerImpl extends EventEmitter implements Consumer {
     }
   }
 
-  /**
-   * Source → consumer video, honouring resync-to-keyframe and the bounded queue.
-   *
-   * Takes the whole item rather than a frame, because a keyframe-prime replays a RETAINED one and has to
-   * arrive by the same route: a primed keyframe is exactly the IDR a resynchronising consumer is waiting
-   * for, so it must clear that wait as a live keyframe does, and it carries the configuration its own media
-   * was coded under. While that wait is unsatisfied a delta frame is dropped — nothing can begin at it.
-   */
+  /** Source → consumer video, dropping dependent pictures until a subscribed consumer receives a keyframe. */
   deliverVideo(item: Extract<TimedMediaFrame, { kind: "video" }>): void {
     if (this.detached) return;
     if (this.awaitingKeyframe) {
@@ -323,9 +300,8 @@ class ConsumerImpl extends EventEmitter implements Consumer {
    * about ahead of the frame that carries it.
    *
    * The single delivery point is where the announcement belongs, because every way media reaches a
-   * consumer passes through here: a live frame, a replayed keyframe-prime, and a backlog drained by
-   * {@link resume}. Comparing against what this consumer was last given rather than what the source last
-   * saw is what makes a primed join and a post-overflow resynchronisation correct.
+   * consumer passes through here, including a backlog drained by {@link resume}. The comparison is
+   * against what this consumer was last given rather than what the source last saw.
    */
   private flush(item: TimedMediaFrame): void {
     if (item.kind === "video") {
@@ -381,8 +357,8 @@ export class SharedLiveSource {
    * {@link LiveStreamStartError}.
    */
   private delivered = { keyframe: false, video: false, audio: false };
-  /** Last keyframe access unit seen — replayed to a joining consumer (keyframe-prime). */
-  private lastKeyframe?: Extract<TimedMediaFrame, { kind: "video" }>;
+  /** Whether the upstream has delivered a keyframe since its last teardown. */
+  private hasKeyframe = false;
   /** Last parameter sets the stream announced — see {@link parameterSets}. */
   private lastParamSets?: ParamSets;
   /**
@@ -401,14 +377,7 @@ export class SharedLiveSource {
   private warmRetryTimer?: ReturnType<typeof setInterval>;
   /** Whether this warm-up has already asked its owner to replace the session. */
   private sessionReplacementAsked = false;
-  /**
-   * Whether the pending watch is a REUSE watch, which any frame settles.
-   *
-   * A cold warm-up needs a keyframe: nothing can be decoded without one. A join already holds the retained
-   * keyframe, so what its watch is missing is evidence the stream is still being served — and a delta frame is
-   * that evidence. Requiring a keyframe there let the deadline outlive an actively delivering stream whose
-   * group of pictures is longer than the window, and the timeout fails EVERY consumer.
-   */
+  /** A reuse watch settles on upstream media independently of each consumer's keyframe gate. */
   private reuseWatch = false;
   /** This source's opaque handle for tracing — see {@link SharedLiveSource.trace}. */
   private readonly traceId: string;
@@ -416,8 +385,8 @@ export class SharedLiveSource {
    * How many re-issues this watch has spent with nothing arriving since it was armed.
    *
    * What a stream delivered BEFORE the current watch is no evidence about now — a reused stream's upstream may
-   * have served plenty and since been dropped by the station, and the retained keyframe replayed to a joining
-   * consumer says nothing either. Only a frame arriving after the watch was armed does, and {@link delivered}
+   * have served plenty and since been dropped by the station. Only a frame arriving after the watch was
+   * armed proves current delivery, and {@link delivered}
    * is reset to track exactly that.
    *
    * The first re-issue is therefore a keepalive: a reuse cannot yet know which case it is in, and a keepalive
@@ -481,7 +450,8 @@ export class SharedLiveSource {
 
   /**
    * Attach a new consumer. Warms the stream on the first attach (or cancels a pending linger teardown
-   * and reuses the warm stream), then replays the cached keyframe so the consumer can decode at once.
+   * and reuses the warm stream). Delivery starts at the next live keyframe so every dependent
+   * picture follows its reference pictures without a gap from a cached keyframe.
    */
   attach(): Consumer {
     return this.attachConsumer(true);
@@ -489,25 +459,24 @@ export class SharedLiveSource {
 
   /**
    * Attach at the same instant a keyframe-aligned prebuffer snapshot is taken. The returned consumer
-   * is not separately keyframe-primed, so replaying `buffered` followed by its live events neither
-   * duplicates the newest IDR nor leaves a gap at the handoff.
+   * continues after `buffered` without waiting for another keyframe or duplicating the newest IDR.
    */
   attachWithPrebuffer(seconds: number): { consumer: Consumer; buffered: TimedMediaFrame[] } {
     const consumer = this.attachConsumer(false);
     return { consumer, buffered: this.bufferedMedia(seconds) };
   }
 
-  private attachConsumer(prime: boolean): Consumer {
+  private attachConsumer(waitForKeyframe: boolean): Consumer {
     if (this.disposed) throw new Error("SharedLiveSource is disposed");
     const wasEmpty = this.consumers.size === 0;
-    const consumer = new ConsumerImpl((c) => this.onDetach(c), this.maxQueue);
+    const consumer = new ConsumerImpl((c) => this.onDetach(c), this.maxQueue, waitForKeyframe);
     this.consumers.add(consumer);
     if (wasEmpty) this.opts.onActive?.();
 
     if (this.lingerTimer.pending) {
       // Re-attach inside the linger window: cancel teardown, keep the warm stream (the reuse flow).
       this.lingerTimer.cancel();
-      if (this._state === "lingering") this._state = this.lastKeyframe ? "live" : "warming";
+      if (this._state === "lingering") this._state = this.hasKeyframe ? "live" : "warming";
       this.logger.debug(
         `${this.tag} re-attach in linger window — reusing warm stream (consumers=${this.consumers.size})`,
       );
@@ -516,9 +485,6 @@ export class SharedLiveSource {
     if (!this.stream) this.warm();
     else this.watchReusedStream();
 
-    // Keyframe-prime: stage the last IDR so a joining consumer decodes without a full GOP wait. The
-    // consumer replays it the moment a "video" listener subscribes (live() is async — see prime()).
-    if (prime && this.lastKeyframe) consumer.prime(this.lastKeyframe);
     return consumer;
   }
 
@@ -545,7 +511,7 @@ export class SharedLiveSource {
     stream.on("audio", (frame) => this.onAudio(frame));
     stream.on("stop", () => this.onUpstreamEnd());
     stream.on("error", (err) => this.onUpstreamError(err));
-    stream.on("unacknowledged", () => this.onStartUnacknowledged());
+    stream.on("unacknowledged", () => this.askForFreshSession("start unacknowledged"));
     stream.start();
   }
 
@@ -566,26 +532,26 @@ export class SharedLiveSource {
   }
 
   /**
-   * A start was abandoned unacknowledged. Ask for a replacement session where nothing has been delivered yet.
+   * Ask the owner for a replacement session where nothing has been delivered yet, answering whether one is coming.
    *
-   * The abandonment is roughly twenty byte-identical sends with no reply, against acknowledgement latencies of
-   * 4–37 ms awake and 238 ms waking, so it is the session that is not being heard rather than a slow device —
-   * `P2PSession` says as much: the camera was never told to stream, so this warm-up can only time out. Where
-   * media has already flowed the abandonment means something else and this does nothing.
+   * An unacknowledged start is roughly twenty byte-identical sends with no reply, against acknowledgement latencies
+   * of 4–37 ms awake and 238 ms waking, so it is the session that is not being heard rather than a slow device: the
+   * camera was never told to stream. Where media has already flowed the abandonment means something else and this
+   * does nothing. The DEADLINE is left running: the window belongs to the attempt, not to the session it started on.
    *
-   * The retry ticker is stopped while a replacement is awaited, because every tick it issues goes to the same
-   * unheard session. The DEADLINE is left running: the window belongs to the attempt, not to the session it
-   * started on.
+   * The retry ticker is stopped only once the owner has said it is replacing the session: an owner that cannot
+   * (an attached camera shares its HomeBase session) leaves the source re-issuing as it always did.
    */
-  private onStartUnacknowledged(): void {
-    if (this.disposed || this.sessionReplacementAsked) return;
-    if (this.delivered.video || this.delivered.audio || this.delivered.keyframe) return;
-    if (!this.opts.onSessionUnreachable) return;
+  private askForFreshSession(why: string): boolean {
+    if (this.disposed || this.sessionReplacementAsked) return false;
+    if (this.delivered.video || this.delivered.audio || this.delivered.keyframe) return false;
+    if (!this.opts.onSessionUnreachable) return false;
     this.sessionReplacementAsked = true;
-    this.logger.debug(`${this.tag} start unacknowledged with nothing delivered — asking for a fresh session`);
+    if (!this.opts.onSessionUnreachable()) return false;
+    this.logger.debug(`${this.tag} ${why} with nothing delivered — warming again on a fresh session`);
     if (this.warmRetryTimer) clearInterval(this.warmRetryTimer);
     this.warmRetryTimer = undefined;
-    this.opts.onSessionUnreachable();
+    return true;
   }
 
   /**
@@ -630,36 +596,33 @@ export class SharedLiveSource {
    * {@link fruitlessReissues} for why one is not enough and why what the stream delivered earlier is not
    * evidence. Once media arrives the keepalive is what is wanted, and an attached camera re-sends a full start
    * either way.
+   *
+   * A forced start that a whole interval later has still produced nothing is a session that acknowledges and
+   * does not serve: a fresh session on the same camera delivers a keyframe within a second, so a warm-up asks
+   * for one rather than forcing starts onto this one until its deadline. Wired only: a cold battery camera is
+   * slow rather than deaf, measured at about 8 s to first media, and replacing its session would cost a wake.
    */
   private reissueStart(): void {
     const current = this.stream;
     if (!current?.nudge) return;
-    this.warmAttempts++;
     const arrivedSinceWatch = this.delivered.video || this.delivered.audio;
     if (arrivedSinceWatch) this.fruitlessReissues = 0;
     else this.fruitlessReissues++;
+    if (
+      this.fruitlessReissues > 2 &&
+      this._state === "warming" &&
+      this.powered === "wired" &&
+      this.askForFreshSession("forced start served nothing")
+    )
+      return;
+    this.warmAttempts++;
     current.nudge(!arrivedSinceWatch && this.fruitlessReissues > 1);
   }
 
   /**
-   * Watch a stream this consumer joined rather than warmed, so a dead one cannot pass for a live one.
-   *
-   * A reused stream hands a joining consumer the retained keyframe at once, which is evidence about the past:
-   * it says the stream WAS being served, not that it still is. A caller commits to media on that frame — a
-   * process, a negotiated session — so a stream the station has quietly stopped serving strands it with no
-   * deadline, because warming is what arms one and a reuse skips warming by definition.
-   *
-   * The watch is the warm-up's own, deadline and retry alike, and the first frame to arrive AFTER the join
-   * clears it, that being the only frame which says the stream is still being served. A stream still serving
-   * clears it long before the deadline fires; one that is not fails its consumers exactly as a cold start that
-   * never delivered would.
-   *
-   * The start is re-issued at once and then on the retry's cadence, because a station that stopped serving a
-   * channel when its last consumer left is the very case the retry recovers: waiting the whole window to
-   * report what one re-issued start can fix is a timeout where a stream was available.
-   *
-   * Nothing is armed while a watch is already pending, so several consumers joining one reused stream share the
-   * watch the first of them started.
+   * Watch an existing upstream with the warm-up retry and deadline. Any video or audio received after
+   * the watch begins confirms delivery and settles it. Each consumer's keyframe gate remains separate.
+   * Concurrent joins share a pending watch; the first join reissues the start immediately.
    */
   private watchReusedStream(): void {
     if (this.warmDeadlineTimer.pending || this.warmRetryTimer !== undefined) return;
@@ -712,7 +675,7 @@ export class SharedLiveSource {
     this.budgetTimer.arm(timerMs(ms, this.batteryBudgetMs), () => this.onBudgetExpire());
   }
 
-  /** Settle a reuse watch on any frame — the join already holds a decodable picture. */
+  /** Settle a reuse watch on any upstream frame without changing consumer keyframe gates. */
   private settleReuseWatch(): void {
     if (!this.reuseWatch) return;
     this.reuseWatch = false;
@@ -745,16 +708,25 @@ export class SharedLiveSource {
    * at all, audio without a single video frame, or access units a decoder cannot begin at.
    *
    * Video takes precedence when both arrived: audio alongside video says nothing a caller needs, while video
-   * without a keyframe does.
+   * without a keyframe does. Every failed start is built here, so this is where its `start-failed` trace is
+   * emitted.
    */
-  private startFailure(reason: LiveStreamStartFailureReason, cause?: unknown): LiveStreamStartError {
-    return new LiveStreamStartError({
+  private startFailure(reason: LiveStreamStartFailureReason, cause?: Error): LiveStreamStartError {
+    const err = new LiveStreamStartError({
       reason,
       stage: this.delivered.video ? "awaiting-keyframe" : this.delivered.audio ? "audio-only" : "awaiting-first-frame",
       timeoutMs: this.warmTimeoutMs,
       attempts: this.warmAttempts,
       cause,
     });
+    this.trace({
+      phase: "start-failed",
+      reason,
+      stage: err.stage,
+      attempts: err.attempts,
+      ...(cause ? { errorName: cause.name } : {}),
+    });
+    return err;
   }
 
   private onVideo(frame: LiveVideoFrame): void {
@@ -764,7 +736,7 @@ export class SharedLiveSource {
     this.lastParamSets = updatedParamSets(frame.data, this.lastParamSets);
     const item = { kind: "video", frame, timestampMs: Date.now(), config: this.configOf(frame) } as const;
     if (frame.keyframe) {
-      this.lastKeyframe = item;
+      this.hasKeyframe = true;
       const wasWarming = this.warmRetryTimer !== undefined || this.warmDeadlineTimer.pending;
       this.delivered.keyframe = true;
       if (this._state === "warming") this._state = "live";
@@ -907,7 +879,7 @@ export class SharedLiveSource {
   }
 
   /**
-   * Stop + drop the underlying stream and clear the prime/ring caches. Rebuildable via attach().
+   * Stop + drop the underlying stream and clear the keyframe/ring caches. Rebuildable via attach().
    *
    * The stream reference is dropped BEFORE stopping it, because `stop()` emits `"stop"` synchronously and
    * this source listens for that — so stopping re-enters `teardown` through {@link onUpstreamEnd}. Clearing
@@ -928,7 +900,7 @@ export class SharedLiveSource {
     } catch {
       /* stream may already be gone */
     }
-    this.lastKeyframe = undefined;
+    this.hasKeyframe = false;
     this.lastParamSets = undefined;
     this.declaredGeometry = undefined;
     this.configuredFrom = undefined;
@@ -994,4 +966,21 @@ export class SharedLiveSource {
     this.teardown("stopped", false);
     if (held) this.opts.onIdle?.();
   }
+}
+
+/**
+ * Attach a consumer, unless the caller has already abandoned the call.
+ *
+ * The acquisition it just waited through can outlast the caller's interest, and a consumer attached for
+ * somebody who has gone keeps the pull warm for nobody. Detaching immediately gives the pull back, which
+ * lets it linger and fall away if this was the only thing holding it, and leaves it untouched if it was
+ * not.
+ */
+export function attachUnlessAborted(source: SharedLiveSource, signal?: AbortSignal): Consumer {
+  const consumer = source.attach();
+  if (signal?.aborted) {
+    consumer.detach();
+    signal.throwIfAborted();
+  }
+  return consumer;
 }

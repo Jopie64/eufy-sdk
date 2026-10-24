@@ -9,6 +9,7 @@
  *    `types.ts`.
  *  - CLEAN_PARAMS — RoboVac Tuya DP space (ids 1 and above), names from the cloud
  *    `get_product_data_point` data_point_list, hence provenance `mega`.
+ *  - MOWER_PARAMS — robot-mower Tuya DP space, names from the mower's Tuya product schema.
  *
  * Which models reported an id, and the capture that named it, are in the commit that adds the entry.
  */
@@ -179,7 +180,7 @@ export const SECURITY_PARAMS: Record<number, ParamDef> = {
   1148: {
     name: "custom1Action",
     type: "number",
-    provenance: "apk",
+    provenance: "verified",
   },
   1149: {
     name: "custom2Action",
@@ -207,9 +208,15 @@ export const SECURITY_PARAMS: Record<number, ParamDef> = {
     provenance: "guessed",
   },
   1157: {
-    name: "jsDelayHome",
+    name: "homeActionTable",
     type: "string",
-    provenance: "apk",
+    provenance: "verified",
+    encoding: "base64+json",
+  },
+  1158: {
+    name: "awayActionTable",
+    type: "string",
+    provenance: "verified",
     encoding: "base64+json",
   },
   1159: {
@@ -388,7 +395,7 @@ export const SECURITY_PARAMS: Record<number, ParamDef> = {
   1225: {
     name: "homeAction",
     type: "number",
-    provenance: "apk",
+    provenance: "verified",
   },
   1229: {
     name: "param1229",
@@ -602,10 +609,13 @@ export const SECURITY_PARAMS: Record<number, ParamDef> = {
     type: "string",
     provenance: "apk",
   },
+  // A camera answers a bare bitmask; a camera behind an NVR-class hub answers a JSON object carrying
+  // it as `ai_detect_type` beside `ai_switch`, `ai_notification`, `ai_use_global` and `channel`.
   1298: {
     name: "aiDetectType",
-    type: "number",
+    type: "string",
     provenance: "apk",
+    encoding: "json",
   },
   // Cameras and a HomeBase 3 answer a bare number; a HomeBase S1 Pro (T9000) answers a JSON envelope
   // (`{"ai_switch":1,"smart_detection":…,"devlist":[…]}`).
@@ -1487,7 +1497,7 @@ export const CLEAN_PARAMS: Record<number, ParamDef> = {
   },
   155: {
     name: "direction",
-    type: "enum",
+    type: "string",
     provenance: "mega",
   },
   156: {
@@ -1766,6 +1776,108 @@ export const DISPLAY_PARAMS: Record<number, ParamDef> = {
   8006: {
     name: "modelCode",
     type: "string",
+    provenance: "mega",
+  },
+};
+
+/**
+ * Robot-mower Tuya DP space — names from the E15's Tuya product schema (`schemaInfo.schema`), each id
+ * also reported by a live E15. Only the scalar data points the `mower` capability reads are listed.
+ */
+export const MOWER_PARAMS: Record<number, ParamDef> = {
+  8: {
+    name: "battery",
+    type: "number",
+    provenance: "mega",
+  },
+  26: {
+    name: "volume",
+    type: "number",
+    provenance: "mega",
+  },
+  47: {
+    name: "childLock",
+    type: "bool",
+    provenance: "mega",
+  },
+  101: {
+    name: "rainAutoReturn",
+    type: "bool",
+    provenance: "mega",
+  },
+  109: {
+    name: "wifiSignal",
+    type: "number",
+    provenance: "mega",
+  },
+  110: {
+    name: "cutHeight",
+    type: "number",
+    provenance: "mega",
+  },
+  118: {
+    name: "mapSaveProgress",
+    type: "number",
+    provenance: "mega",
+  },
+  125: {
+    name: "stationUsedTime",
+    type: "number",
+    provenance: "mega",
+  },
+  126: {
+    name: "bladeUsedTime",
+    type: "number",
+    provenance: "mega",
+  },
+  128: {
+    name: "edgeTrim",
+    type: "bool",
+    provenance: "mega",
+  },
+  130: {
+    name: "workAngleEnabled",
+    type: "bool",
+    provenance: "mega",
+  },
+  131: {
+    name: "workAngle",
+    type: "number",
+    provenance: "mega",
+  },
+  132: {
+    name: "smartNoGoZones",
+    type: "bool",
+    provenance: "mega",
+  },
+  133: {
+    name: "birdViewCapture",
+    type: "bool",
+    provenance: "mega",
+  },
+  134: {
+    name: "network",
+    type: "string",
+    provenance: "mega",
+  },
+  137: {
+    name: "cellularEnabled",
+    type: "bool",
+    provenance: "mega",
+  },
+  139: {
+    name: "edgeDistance",
+    type: "number",
+    provenance: "mega",
+  },
+  140: {
+    name: "gpsAntiTheft",
+    type: "bool",
+    provenance: "mega",
+  },
+  141: {
+    name: "sparseLawnOptimization",
+    type: "bool",
     provenance: "mega",
   },
 };

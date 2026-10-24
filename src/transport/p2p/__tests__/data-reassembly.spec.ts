@@ -45,9 +45,12 @@ function harness() {
   };
   target.send = vi.fn();
   const received: P2PFrame[] = [];
+  const videoGaps: number[] = [];
   session.on("data", (frame) => received.push(frame));
+  session.on("videoGap", () => videoGaps.push(Date.now()));
   return {
     received,
+    videoGaps,
     debug: logger.debug,
     feed: (packet: Buffer) => target.onData(packet, ADDRESS),
     close: () => session.close(),
@@ -78,7 +81,7 @@ describe("P2P data reassembly", () => {
   });
 
   it("completes the frame when the missing datagram is retransmitted", () => {
-    const { feed, received, gapTraces } = harness();
+    const { feed, received, gapTraces, videoGaps } = harness();
     const payload = Buffer.alloc(48, 7);
     const frame = commandFrame(40, 1300, payload);
 
@@ -91,6 +94,7 @@ describe("P2P data reassembly", () => {
     expect(received[0]!.commandId).toBe(1300);
     expect(received[0]!.raw).toEqual(payload);
     expect(gapTraces()).toHaveLength(0);
+    expect(videoGaps).toHaveLength(0);
   });
 
   it("re-arms the wait when abandoning one hole leaves another hole held", () => {
@@ -151,7 +155,7 @@ describe("P2P data reassembly", () => {
   it("drops an incomplete frame once a forward gap goes unrepaired, and resynchronizes", () => {
     vi.useFakeTimers();
     try {
-      const { feed, received, debug } = harness();
+      const { feed, received, debug, videoGaps } = harness();
       const incomplete = commandFrame(40, 1300, Buffer.alloc(48, 7)).subarray(0, 20);
 
       feed(dataPacket(40, incomplete));
@@ -163,11 +167,28 @@ describe("P2P data reassembly", () => {
       vi.advanceTimersToNextTimer();
 
       expect(received).toHaveLength(1);
+      expect(videoGaps).toHaveLength(1);
       expect(received[0]!.commandId).toBe(1301);
       expect(debug).toHaveBeenCalledWith(
         LIVE_TRACE_MESSAGE,
         expect.objectContaining({ phase: "datagram-gap", dataType: VIDEO_DATA_TYPE }),
       );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports an expired whole-video-frame gap even without a partial frame", () => {
+    vi.useFakeTimers();
+    try {
+      const { feed, videoGaps, received, gapTraces } = harness();
+      feed(dataPacket(40, commandFrame(40, 1300, Buffer.from([1]))));
+      feed(dataPacket(42, commandFrame(42, 1300, Buffer.from([3]))));
+      expect(videoGaps).toHaveLength(0);
+      vi.advanceTimersToNextTimer();
+      expect(videoGaps).toHaveLength(1);
+      expect(gapTraces()).toHaveLength(1);
+      expect(received.map((frame) => frame.raw[0])).toEqual([1, 3]);
     } finally {
       vi.useRealTimers();
     }
@@ -240,7 +261,7 @@ describe("P2P data reassembly", () => {
   it("resynchronizes onto numbering the device restarts mid-connection", () => {
     vi.useFakeTimers();
     try {
-      const { feed, received, debug } = harness();
+      const { feed, received, debug, videoGaps } = harness();
       const payload = Buffer.alloc(48, 7);
       const restarted = commandFrame(0, 1300, payload);
 
@@ -253,6 +274,7 @@ describe("P2P data reassembly", () => {
 
       expect(received.map(({ commandId }) => commandId)).toEqual([1300, 1301]);
       expect(received[0]!.raw).toEqual(payload);
+      expect(videoGaps).toHaveLength(1);
       expect(vi.getTimerCount()).toBe(0);
       expect(debug).toHaveBeenCalledWith(
         LIVE_TRACE_MESSAGE,
@@ -261,6 +283,19 @@ describe("P2P data reassembly", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("traces a video sequence restart with no partial frame", () => {
+    const { feed, received, videoGaps, debug } = harness();
+    feed(dataPacket(20_000, commandFrame(20_000, 1300, Buffer.from([1]))));
+    feed(dataPacket(0, commandFrame(0, 1300, Buffer.from([2]))));
+
+    expect(received.map((frame) => frame.raw[0])).toEqual([1, 2]);
+    expect(videoGaps).toHaveLength(1);
+    expect(debug).toHaveBeenCalledWith(
+      LIVE_TRACE_MESSAGE,
+      expect.objectContaining({ phase: "sequence-restart", dataType: VIDEO_DATA_TYPE }),
+    );
   });
 
   it.each([1, 4, 15])(
@@ -292,5 +327,48 @@ describe("P2P data reassembly", () => {
 
     expect(received).toHaveLength(1);
     expect(received[0]!.raw).toEqual(payload);
+  });
+
+  it("copies a 234 KB fragmented video payload once while preserving split headers and packed frames", async () => {
+    const { feed, received, close } = harness();
+    const payload = Buffer.alloc(234_129, 7);
+    const header = Buffer.alloc(16);
+    header.write("XZYH");
+    header.writeUInt16LE(1300, 4);
+    header.writeUInt32LE(payload.length, 6);
+    header[10] = 1;
+    const tail = Buffer.from([1, 2, 3, 4]);
+    const stream = Buffer.concat([
+      Buffer.concat([header, payload]),
+      commandFrame(40, 1301, Buffer.alloc(0)),
+      commandFrame(40, 1300, tail),
+    ]);
+    const packets: Buffer[] = [];
+    let offset = 0;
+    for (const length of [1, 3, 4, 7]) {
+      packets.push(dataPacket(40 + packets.length, stream.subarray(offset, offset + length)));
+      offset += length;
+    }
+    packets.push(dataPacket(40 + packets.length, Buffer.alloc(0)));
+    while (offset < stream.length) {
+      packets.push(dataPacket(40 + packets.length, stream.subarray(offset, offset + 1024)));
+      offset += 1024;
+    }
+    const copied: number[] = [];
+    const concat = Buffer.concat;
+    const spy = vi.spyOn(Buffer, "concat").mockImplementation((list, totalLength) => {
+      const result = concat(list, totalLength);
+      copied.push(result.length);
+      return result;
+    });
+    try {
+      for (const packet of packets) feed(packet);
+      expect(received.map((frame) => frame.commandId)).toEqual([1300, 1301, 1300]);
+      expect(received.map((frame) => frame.raw)).toEqual([payload, Buffer.alloc(0), tail]);
+      expect(copied.filter((bytes) => bytes > 1400)).toEqual([payload.length]);
+    } finally {
+      spy.mockRestore();
+      await close();
+    }
   });
 });

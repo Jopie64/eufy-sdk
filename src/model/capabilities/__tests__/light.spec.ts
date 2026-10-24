@@ -1,8 +1,9 @@
 import { LIGHT, LIGHT_CMD, type LightActions } from "../light.js";
 import { unobservableMembers } from "../members.js";
-import { buildCommand } from "../index.js";
+import { buildCommand, detectCapabilities } from "../index.js";
 import { bind } from "./bind.js";
 import type { CommandContext } from "../types.js";
+import { DeviceType } from "../../device-types.js";
 import type { Command } from "../../../core/contracts.js";
 
 /**
@@ -45,12 +46,13 @@ describe("light capability module", () => {
   });
 
   it("detects only from real SPOTLIGHT params (NOT 1045 status LED)", () => {
-    // 1045 (status LED, on every camera) must NOT be here — that's `camera`, not `light`.
-    expect(LIGHT.detection?.evidenceParams).not.toContain(1045);
-    expect(LIGHT.detection?.evidenceParams).toEqual(expect.arrayContaining([1400, 6080, 1401]));
-    const re = LIGHT.detection!.modelHints![0];
-    expect(re.test("Floodlight Cam")).toBe(true);
-    expect(re.test("Wired Doorbell")).toBe(false);
+    // Exercise the detector rather than its internal evidence representation.
+    expect(detectCapabilities({ params: { 1045: "1" } }, "camera")).not.toContain("light");
+    for (const param of [1400, 1401, 1403, 6080, 6082, 1413]) {
+      expect(detectCapabilities({ params: { [param]: "1" } }, "camera")).toContain("light");
+    }
+    expect(detectCapabilities({ name: "Floodlight Cam" }, "camera")).toContain("light");
+    expect(detectCapabilities({ name: "Wired Doorbell" }, "camera")).not.toContain("light");
   });
 
   describe("buildCommand — variant resolution", () => {
@@ -91,6 +93,39 @@ describe("light capability module", () => {
         form: "int-string",
         channel: 0,
       });
+    });
+
+    it("on/off on an E330 Pro / T8600 (deviceType 24) → set-param pinned to int-string (1400)", () => {
+      expect(intent("on", true, { ...ctx(2), deviceType: DeviceType.PROFESSIONAL_247 })).toEqual({
+        kind: "set-param",
+        param: LIGHT_CMD.FLOODLIGHT_SWITCH,
+        value: 1,
+        form: "int-string",
+        channel: 2,
+      });
+      expect(intent("off", false, { ...ctx(), deviceType: DeviceType.PROFESSIONAL_247 })).toMatchObject({
+        kind: "set-param",
+        form: "int-string",
+        value: 0,
+      });
+    });
+
+    it("does not assign a spotlight switch wire to SoloCam E30", () => {
+      expect(() => intent("on", true, { ...ctx(), deviceType: DeviceType.SOLO_CAMERA_E30 })).toThrow(
+        /light: unknown spotlight switch wire format/,
+      );
+    });
+
+    it("spotlightEnabled on a T8423 (deviceType 38) → session-chosen level for 1403; brightness stays direct-binary", () => {
+      const t8423 = { ...ctx(), deviceType: 38 };
+      expect(intent("spotlightEnabled", false, t8423)).toEqual({
+        kind: "set-param",
+        param: LIGHT_CMD.SPOTLIGHT_ENABLE,
+        value: 0,
+        form: "auto",
+        channel: 0,
+      });
+      expect(intent("brightness", 50, t8423)).toMatchObject({ form: "direct-binary" });
     });
 
     it("brightness/colorTemp/enabled → set-param pinned to direct-binary with the right param", () => {

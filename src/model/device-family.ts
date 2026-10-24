@@ -36,6 +36,11 @@ export interface FamilyContext {
    * `"eufy_home_tuya"` devices are on the ThingClips/Tuya Cloud platform, not Anker AIoT MQTT.
    */
   category?: string;
+  /**
+   * Full device serial, when known. The one family split that no type number expresses: the vendor
+   * reuses one DeviceType across generations of a product and distinguishes them by serial.
+   */
+  serial?: string;
 }
 
 // ── DeviceType sets ─────────────────────────────────────────────────────────────────────────────
@@ -123,6 +128,17 @@ export const isOutdoorPanTilt = (ctx: FamilyContext): boolean => has(OUTDOOR_PT_
 export const isFloodLight = (ctx: FamilyContext): boolean => has(FLOODLIGHT_TYPES, ctx.deviceType);
 /** HomeBase-family hub (has a speaker/alarm) — a station EXCLUDING the NVRs, per `HOMEBASE_TYPES`. */
 export const isHomeBase = (ctx: FamilyContext): boolean => has(HOMEBASE_TYPES, ctx.deviceType);
+/** HomeBase S1 Pro (`STATION_9000`), the station the app drives over its WebRTC control channel. */
+export const isStation9000 = (ctx: FamilyContext): boolean => ctx.deviceType === DeviceType.STATION_9000;
+/** T8N00 NVR, identified by its reported model. */
+export const isNvrT8N00 = (ctx: FamilyContext): boolean => ctx.model === "T8N00";
+
+/** PoE cameras whose media is served by their NVR's portal call. */
+export const isNvrMediaCamera = (ctx: FamilyContext): boolean => ctx.model === "T8E00" || ctx.model === "T8P00";
+/** PoE S4 camera with independently streamed fixed and movable optical views. */
+export const isNvrDualLensCamera = (ctx: FamilyContext): boolean => ctx.model === "T8E00";
+/** Video Doorbell C31 (T8223) or C30 (T8224), streamed by the app over the portal `call` route. */
+export const isCallDoorbell = (ctx: FamilyContext): boolean => ctx.model === "T8223" || ctx.model === "T8224";
 /** Wired doorbell (DeviceType.DOORBELL). */
 export const isWiredDoorbell = (ctx: FamilyContext): boolean => ctx.deviceType === DeviceType.DOORBELL;
 
@@ -154,3 +170,18 @@ export const isAiotVacuum = (ctx: FamilyContext): boolean => ctx.category !== "e
  * vacuums receive the same write actions as AIoT ones, routed by the facade's `routeCommand`.
  */
 export const isTuyaVacuum = (ctx: FamilyContext): boolean => ctx.category === "eufy_home_tuya";
+
+/** Video Smart Lock S330, identified by its distinct cloud device type. */
+export const isVideoSmartLock = (ctx: FamilyContext): boolean => ctx.deviceType === DeviceType.LOCK_8530;
+
+/**
+ * The classic Wi-Fi smart lock — the unit whose actuation rides a per-command ECDH-wrapped key rather than
+ * the shared `ff09` frame: DeviceType 51 with a serial in the `T8520` range whose seventh character is `2`,
+ * the one range driven on hardware. The DeviceType alone does not identify it, since later units share the
+ * number and take the `ff09` frame, and a device whose serial is unknown is not guessed either way.
+ */
+export const isClassicWifiLock = (ctx: FamilyContext): boolean =>
+  ctx.deviceType === DeviceType.LOCK_WIFI &&
+  typeof ctx.serial === "string" &&
+  ctx.serial.startsWith("T8520") &&
+  ctx.serial.charAt(6) === "2";

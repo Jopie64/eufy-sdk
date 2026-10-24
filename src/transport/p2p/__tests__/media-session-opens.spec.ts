@@ -20,23 +20,34 @@ const built: FakeSession[] = [];
 /** Set before an open to make the NEXT session connect without ever getting a level-2 key. */
 let nextSessionHasNoKey = false;
 
+/**
+ * Set before an open to make the NEXT session's path answer this many ms after `connect()` resolves, or never
+ * for `Infinity`. `connect()` itself resolves at once, as the real one does once its lookups are sent.
+ */
+let nextSessionConnectsAfterMs = 0;
+
 class FakeSession extends EventEmitter {
   isConnected = false;
   traceId = `trace-${built.length}`;
   opts: Record<string, unknown>;
   hasKey: boolean;
+  connectsAfterMs: number;
   constructor(opts: Record<string, unknown>) {
     super();
     this.opts = opts;
     this.hasKey = !nextSessionHasNoKey;
+    this.connectsAfterMs = nextSessionConnectsAfterMs;
     nextSessionHasNoKey = false;
+    nextSessionConnectsAfterMs = 0;
     built.push(this);
   }
   async connect() {
-    this.isConnected = true;
+    if (this.connectsAfterMs === 0) this.isConnected = true;
+    else if (Number.isFinite(this.connectsAfterMs)) setTimeout(() => (this.isConnected = true), this.connectsAfterMs);
   }
+  /** A key wait begun before the path answers is the one that runs out: the key rides the connected path. */
   async awaitLevel2Key() {
-    return this.hasKey;
+    return this.hasKey && this.isConnected;
   }
   repromptLevel2Key() {
     return false;
@@ -52,6 +63,7 @@ vi.mock("../p2p-session.js", async (importOriginal) => ({
 }));
 
 const { P2PCommandRouter } = await import("../command-router.js");
+const { CONNECT_TIMEOUT_MS } = await import("../p2p-session.js");
 type Router = InstanceType<typeof P2PCommandRouter>;
 
 const STATION_SN = "T8010P0000000000";
@@ -66,10 +78,12 @@ function router() {
   built.length = 0;
   events.length = 0;
   nextSessionHasNoKey = false;
+  nextSessionConnectsAfterMs = 0;
   const record = (sn: string, channel: number, parent?: string) => ({
     sn,
     stationSn: parent ?? sn,
     p2pDid: DID,
+    channel: channel,
     raw: { parent_sn: parent, device_channel: channel, p2p_did: DID, member: { admin_user_id: ACCOUNT_ID } },
   });
   return new P2PCommandRouter({
@@ -166,6 +180,45 @@ describe("a second live camera on a claimed station session", () => {
   });
 
   /**
+   * A relay connect lands about 25 s after `connect()` resolves, so a key wait begun at the open would run
+   * out on the connect rather than on the key. The media session is handed over once it connects and holds
+   * its key.
+   */
+  it("waits for a media session's path to connect before it waits for the key", async () => {
+    vi.useFakeTimers();
+    try {
+      const r = router();
+      (await openLive(r, CAM_A)).attach();
+
+      nextSessionConnectsAfterMs = 25_200;
+      const opened = openLive(r, CAM_B);
+      await vi.advanceTimersByTimeAsync(25_400);
+
+      await expect(opened).resolves.toBeDefined();
+      expect(built[1].isConnected).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports a media session that never connects as an unreachable station, not a missing key", async () => {
+    vi.useFakeTimers();
+    try {
+      const r = router();
+      (await openLive(r, CAM_A)).attach();
+
+      nextSessionConnectsAfterMs = Infinity;
+      const opened = openLive(r, CAM_B);
+      const outcome = expect(opened).rejects.toMatchObject({ name: "StationUnreachableError", stationSn: STATION_SN });
+      await vi.advanceTimersByTimeAsync(CONNECT_TIMEOUT_MS + 400);
+
+      await outcome;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
    * The linger sweep relieves contention over ONE session. A sibling lingering on a connection of its own is
    * not competing for the one being started on, so dropping it would close a socket and throw away the cheap
    * re-attach the linger exists for, to settle a competition that is not happening.
@@ -218,5 +271,36 @@ describe("a second live camera on a claimed station session", () => {
     expect(new Set(keys).size).toBe(2);
     expect(keys).toContain(STATION_SN);
     expect(built).toHaveLength(2);
+  });
+  it("keeps independent media delivering when the station-control connection closes", async () => {
+    const r = router();
+    const a = await openLive(r, CAM_A);
+    a.attach();
+    const b = await openLive(r, CAM_B);
+    const consumer = b.attach() as EventEmitter;
+    const delivered = vi.fn();
+    consumer.on("video", delivered);
+    const disposedA = vi.spyOn(a, "dispose");
+    const disposedB = vi.spyOn(b, "dispose");
+    try {
+      await built[0].close();
+      expect(disposedA).toHaveBeenCalledOnce();
+      expect(disposedB).not.toHaveBeenCalled();
+      expect(sources(r).has(`${STATION_SN}:0`)).toBe(false);
+      expect(sources(r).get(`${STATION_SN}:2`)).toBe(b);
+      expect(built[1].isConnected).toBe(true);
+      const frame = {
+        data: Buffer.from("000000016588", "hex"),
+        keyframe: true,
+        codec: "h264",
+        width: 640,
+        height: 480,
+        timestamp: 1,
+      };
+      (b as unknown as { stream: EventEmitter }).stream.emit("video", frame);
+      expect(delivered).toHaveBeenCalledWith(frame);
+    } finally {
+      await r.closeAll();
+    }
   });
 });

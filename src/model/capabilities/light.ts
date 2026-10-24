@@ -132,7 +132,7 @@ function autoSpotlightCommand(on: boolean, ctx: CommandContext, opts: AutoSpotli
  *  - `"json"`: JSON control-payload (`{commandType:1400,data:{time,type,value}}` under 1700) —
  *    FLOODLIGHT_8425, wall-light cams, indoor pan/tilt (31/35) and CAMERA_4G_S330.
  *  - `"int-string"`: level-1 int+string — indoor/outdoor 1080p/2K siblings, outdoor-PT/solo-E30,
- *    and the Cam2C/Cam2/Cam3 families.
+ *    E330 Pro (T8600, deviceType 24, confirmed live), and the Cam2C/Cam2/Cam3 families.
  * NOTE: this is FRAME SHAPE only, not encryption LEVEL. The level (L1 vs L2) is a runtime topology
  * trait resolved at send time — never fixed by family here. The switch shape happens to be L1 for
  * both branches; brightness/colorTemp (below) are a separate, pinned case.
@@ -167,13 +167,13 @@ const LIGHT_SWITCH_INT_STRING_TYPES: ReadonlySet<number> = new Set<number>([
   DeviceType.INDOOR_OUTDOOR_CAMERA_2K,
   DeviceType.INDOOR_OUTDOOR_CAMERA_1080P,
   DeviceType.OUTDOOR_PT_CAMERA,
-  DeviceType.SOLO_CAMERA_E30,
   DeviceType.CAMERA2C,
   DeviceType.CAMERA2,
   DeviceType.CAMERA2_PRO,
   DeviceType.CAMERA2C_PRO,
   DeviceType.CAMERA3,
   DeviceType.CAMERA3C,
+  DeviceType.PROFESSIONAL_247,
 ]);
 
 /**
@@ -308,6 +308,9 @@ export const LIGHT_MEMBERS = {
    * This is the switch a user changes and expects to STAY changed. {@link isOn} is a different fact:
    * the lamp being lit right now, driven by whichever
    * client is streaming — the vendor app lights it for a live view and drops it on quitting.
+   *
+   * The T8423 write takes the session-chosen level; level-1 int+string was verified live on a standalone
+   * unit.
    */
   spotlightEnabled: {
     param: LIGHT_CMD.SPOTLIGHT_ENABLE,
@@ -317,7 +320,13 @@ export const LIGHT_MEMBERS = {
     description:
       "The spotlight master switch, distinct from the on/off above — whether the spotlight may light at " +
       "all. Read verified live on a T8170 (param 1403, direct polarity: 1 = enabled).",
-    write: (v, ctx) => directBinary(LIGHT_CMD.SPOTLIGHT_ENABLE, asBool(v) ? 1 : 0, ctx),
+    write: (v, ctx) =>
+      setScalar(
+        LIGHT_CMD.SPOTLIGHT_ENABLE,
+        asBool(v) ? 1 : 0,
+        ctx,
+        ctx.deviceType === DeviceType.FLOODLIGHT_CAMERA_8423 ? "auto" : "direct-binary",
+      ),
     writeAs: "setEnabled",
   },
 } as const satisfies Members;
@@ -327,12 +336,14 @@ export const LIGHT: CapabilityModule = {
   description: "Floodlight / spotlight manual switch and brightness.",
   members: LIGHT_MEMBERS,
   properties: propertiesOf(LIGHT_MEMBERS),
-  // `light` = a real SPOTLIGHT, detected only from genuine spotlight params — NOT 1045 (that's the
-  // status LED, on every camera; it belongs to `camera`). Params: floodlight switch 1400, spotlight
-  // brightness/enable 1401/1403, indoor-spot enable/bright 6080/6082. Plus explicit light model names.
+  // Three T8171 units on firmware 1.2.1.6 report 1400/1401/1403 without a spotlight, so those
+  // param ids are not sufficient evidence for that model. The camera status LED (1045) is not light.
+  // Other models keep the existing param and name evidence.
   detection: {
-    evidenceParams: [1400, 1401, 1403, 6080, 6082, 1413],
     modelHints: [/floodlight|wall.?light|spot.?light|search.?light/i],
+    detect: (record) =>
+      record.model !== "T8171" &&
+      [1400, 1401, 1403, 6080, 6082, 1413].some((param) => Object.hasOwn(record.params ?? {}, param)),
   },
   /**
    * Only what the member table cannot express: `on`/`off` as no-argument verbs over the same wire as the

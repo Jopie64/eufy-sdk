@@ -24,6 +24,7 @@ import {
 import { MemorySessionStore, isSessionValid, type SessionStore } from "../../core/store.js";
 import { noopLogger, type Logger } from "../../core/logger.js";
 import type { SecureMqttCredentials } from "../mqtt/secure-mqtt.js";
+import { withoutTokenEcho } from "../token-echo.js";
 import { downloadMediaResource, mediaFailureError, MediaDownloadAuthenticationError } from "./media-download.js";
 import { randomPhoneModel, randomUserAgent } from "./phone-model.js";
 import { normalizePushImage } from "./decodeImageV1.js";
@@ -301,17 +302,6 @@ function tokenRejected(code: number | undefined, msg: string | undefined): boole
 }
 
 /**
- * Strip a token the gateway echoed back into its own error message.
- *
- * `"token not exist, token = <the rejected token>"` is the vendor's wording, and that message travels into the
- * error the SDK surfaces. A credential that has just been rejected is still a credential, and it is
- * never the part of the message that explains anything.
- */
-function withoutTokenEcho(text: string): string {
-  return text.replace(/token\s*[=:]\s*"?[A-Za-z0-9._-]{8,}"?/gi, "token = <redacted>");
-}
-
-/**
  * {@link MegaHttpClient.postSigned}'s bookkeeping for the two recoveries it performs on itself, so each is
  * attempted once per call rather than once per rejection.
  * @internal
@@ -330,6 +320,8 @@ export interface SignedRetry {
 export class MegaHttpClient {
   private readonly cfg: Required<Pick<MegaClientConfig, "appName" | "appVersion" | "countryCode">> & MegaClientConfig;
   private region: RegionShard;
+  /** The host `estimate_domain` answered, persisted with the session. */
+  private estimatedDomain = "";
   private bootstrapDomain?: string;
   private sessionKey?: SessionEntry;
   /** Per-host ECDH session keys for non-mega gateways (e.g. eufylife) keyed by host. */
@@ -349,6 +341,8 @@ export class MegaHttpClient {
   /** True while a 2FA code is outstanding: `auth_` holds only the limited pre-verify token, so the
    *  restored-session short-circuit must NOT treat it as a usable session. Cleared on Ok/reset. */
   private pending2fa = false;
+  /** An autonomous re-login answered captcha/2FA; see {@link canReauthenticate}. */
+  private reloginChallenged = false;
   private tokenExpiresAt = 0;
   /**
    * Stable per-install device id: `openudid` as configured, as restored from the session store, or as
@@ -407,10 +401,12 @@ export class MegaHttpClient {
 
   /**
    * Install the session the store holds, if it holds a usable one: the token + its bound ECDH key, skipping
-   * estimate/key-exchange/login/2FA entirely. Answers the token adopted, or `undefined`.
+   * estimate/key-exchange/login/2FA entirely. Answers the token adopted, or `undefined`. A session logged in
+   * with a country other than the configured one is not usable: its shard is the other country's.
    *
    * Read at construction, and again when a rejection is being recovered from — a store SHARED with another
    * client may already hold the session that client obtained, which is cheaper to adopt than to compete with.
+   * An adopted session is a complete one, so it ends any 2FA or challenged re-login this client was left with.
    *
    * Note: the device identity (openudid + phone model + media UA) is NOT restored here — it is resolved once
    * in the constructor, where an explicit config wins over the stored value, and must not be re-derived from a
@@ -419,7 +415,14 @@ export class MegaHttpClient {
   private hydrateFromStore(): string | undefined {
     const saved = this.store.load();
     if (!isSessionValid(saved) || !saved) return undefined;
+    if (saved.countryCode !== undefined && saved.countryCode.toUpperCase() !== this.cfg.countryCode.toUpperCase()) {
+      this.logger.info(
+        `[mega] stored session was logged in with country ${saved.countryCode}, configured ${this.cfg.countryCode} — logging in again`,
+      );
+      return undefined;
+    }
     this.region = saved.region;
+    this.estimatedDomain = saved.estimatedDomain ?? "";
     this.auth_ = {
       userId: saved.userId,
       accountUserId: saved.accountUserId,
@@ -427,6 +430,8 @@ export class MegaHttpClient {
       geoKey: saved.geoKey,
     };
     this.tokenExpiresAt = saved.tokenExpiresAt;
+    this.pending2fa = false;
+    this.reloginChallenged = false;
     this.sessionKey = {
       keyIdent: saved.keyIdent,
       shareKey: saved.shareKey,
@@ -445,6 +450,25 @@ export class MegaHttpClient {
   /** The active region shard (e.g. `"eu-pr"`, `"us-pr"`), set after {@link login} or a region override. */
   get regionShard(): RegionShard {
     return this.region;
+  }
+
+  /**
+   * The shard the RTC signalling signs on: the regional prefix of the estimated domain
+   * (`…-ie-…`/`…-ie.` → `ie-pr`), else {@link regionShard}. The eu/us classification cannot name shards
+   * like `ie-pr`, whose accounts need the IE sign host and cluster.
+   */
+  get rtcShard(): string {
+    const m = /-([a-z]{2})(?:[.-]|$)/i.exec(this.estimatedDomain);
+    return m ? `${m[1].toLowerCase()}-pr` : this.region;
+  }
+
+  /**
+   * The credentials the RTC signalling needs; `undefined` while logged out. The sign is refused
+   * ("gtoken not equal userid") unless its gtoken is the one every authed HTTP call carries.
+   */
+  rtcIdentity(): { authToken: string; userId: string; gtoken: string } | undefined {
+    if (!this.auth_) return undefined;
+    return { authToken: this.auth_.authToken, userId: this.auth_.userId, gtoken: gtoken(this.gtokenUserId()) };
   }
 
   /**
@@ -555,6 +579,7 @@ export class MegaHttpClient {
     const env = res.data as ApiEnvelope<Record<string, unknown>>;
     const d = env?.data ?? {};
     const domain = (d.domain ?? d.host ?? d.server_secret_info ?? "") as string;
+    this.estimatedDomain = domain;
     const blob = JSON.stringify(d);
     if (blob.includes("-eu-") || domain.includes("-eu-")) this.region = "eu-pr";
     else if (blob.includes("-us-") || domain.includes("-us-")) this.region = "us-pr";
@@ -827,6 +852,23 @@ export class MegaHttpClient {
   }
 
   /**
+   * Fetch the account's devices as the `devicerelation` service lists them, `{attribute: 7, house_id: ""}`.
+   *
+   * Each entry is `{device: {device_sn, dps, …}}`, and `dps` is the cloud's last-known value of every
+   * data point that device has reported, keyed by DP number. Answered for an account a device is shared
+   * with as well as for its owner. Sent with `category: eufy_home`, without which the service answers
+   * `10000`.
+   */
+  getDeviceRelationList<T = unknown>(): Promise<T> {
+    return this.post<T>(
+      "devicerelation",
+      "/app/devicerelation/get_device_list",
+      { attribute: 7, house_id: "" },
+      { category: "eufy_home" },
+    );
+  }
+
+  /**
    * Fetch one page of a device's **cleaning history** from the mega `clean` service.
    *
    * Body is `{ device_sn, num, page }` — `num` is the page SIZE and `page` is 1-based. Returns the raw
@@ -964,6 +1006,37 @@ export class MegaHttpClient {
     // (ENOTFOUND). Other regions get a suffix (eu → security-app-eu). Verified via DNS.
     return shard === "us" ? "security-app.eufylife.com" : `security-app-${shard}.eufylife.com`;
   }
+
+  /**
+   * The device's long-lived P-256 public key, as the cloud publishes it for key-wrapped commands
+   * (`type=2`): 64 bytes hex with no `04` prefix. A plain authed GET on the security-app host — the
+   * one read here that is neither signed nor body-encrypted, matching how the app fetches it.
+   * Cached per serial for the client's lifetime; the key does not rotate in normal operation.
+   */
+  async getDevicePublicKey(deviceSn: string): Promise<string> {
+    const cached = this.devicePublicKeys.get(deviceSn);
+    if (cached) return cached;
+    const url = `https://${this.securityAppHost()}/v1/app/public_key/query?device_sn=${encodeURIComponent(deviceSn)}&type=2`;
+    const res = await fetch(url, {
+      method: "GET",
+      headers: { ...this.baseHeaders(), ...this.authTokenHeaders() },
+      signal: AbortSignal.timeout(20_000),
+    });
+    const env = parseMaybeJson(await res.text()) as ApiEnvelope<{ public_key?: string }> | undefined;
+    const key = env?.data?.public_key;
+    if (res.status !== 200 || env?.code !== 0 || typeof key !== "string" || !key.length) {
+      throw new MegaApiError(
+        `public_key/query failed (${res.status}/${env?.code}): ${env?.msg ?? "no public key"}`,
+        env?.code,
+        res.status,
+      );
+    }
+    this.devicePublicKeys.set(deviceSn, key);
+    return key;
+  }
+
+  /** Per-serial cache for {@link getDevicePublicKey}. */
+  private readonly devicePublicKeys = new Map<string, string>();
 
   /**
    * Signed+encrypted POST to the security-app data host (face recognition, etc.).
@@ -1205,11 +1278,13 @@ export class MegaHttpClient {
    * Structural rather than a list of paths: a login round trip is itself an authenticated call while a limited
    * token is held, so re-logging in from inside one would recurse — and a path list would have to be
    * maintained alongside every request the login flow makes. A 2FA code already outstanding is a login a human
-   * is part-way through, and restarting it silently would discard it. No credentials means nothing to try,
+   * is part-way through, and restarting it silently would discard it. A re-login that already came back needing
+   * a captcha or a 2FA code would need the same again, and each attempt sends the account another code, so
+   * none is tried until a login completes or a stored session is adopted. No credentials means nothing to try,
    * so the rejection surfaces instead.
    */
   private canReauthenticate(): boolean {
-    return !!this.cfg.email && !!this.cfg.password && !this.loggingIn && !this.pending2fa;
+    return !!this.cfg.email && !!this.cfg.password && !this.loggingIn && !this.pending2fa && !this.reloginChallenged;
   }
 
   /**
@@ -1227,7 +1302,10 @@ export class MegaHttpClient {
     this.reauthAttempt ??= this.login()
       .then((result) => {
         if (result.status === LoginStatus.Ok) this.logger.debug("[mega] token was rejected — logged in again");
-        else this.logger.warn(`[mega] token was rejected and the re-login needs ${result.status} — cannot recover`);
+        else {
+          this.reloginChallenged = true;
+          this.logger.warn(`[mega] token was rejected and the re-login needs ${result.status} — cannot recover`);
+        }
         return result.status === LoginStatus.Ok;
       })
       .catch((e: unknown) => {
@@ -1319,6 +1397,7 @@ export class MegaHttpClient {
 
     this.pendingCaptchaId = undefined;
     this.pending2fa = false;
+    this.reloginChallenged = false;
     this.auth_ = { userId, accountUserId, authToken, geoKey };
     this.tokenExpiresAt = reply.tokenExpiresAt;
     // Re-exchange WITH the auth token so the gateway binds the key-ident to the user.
@@ -1338,6 +1417,8 @@ export class MegaHttpClient {
       authToken: this.auth_.authToken,
       geoKey: this.auth_.geoKey,
       region: this.region,
+      countryCode: this.cfg.countryCode,
+      estimatedDomain: this.estimatedDomain,
       openudid: this.openudid,
       phoneModel: this.phoneModel,
       mediaUserAgent: this.mediaUserAgent,

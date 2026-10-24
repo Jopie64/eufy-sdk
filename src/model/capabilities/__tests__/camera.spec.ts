@@ -12,7 +12,6 @@ import {
   StreamingQuality,
   STREAMING_QUALITY_TIERS,
   resolveStreamingQuality,
-  resolveStreamingQualityTier,
 } from "../camera.js";
 import type { RecordingQualityName } from "../camera.js";
 import { buildCommand } from "../index.js";
@@ -22,7 +21,7 @@ import type { CameraActions } from "../camera.js";
 import { DeviceType } from "../../device-types.js";
 import { Device } from "../../device.js";
 import type { CommandContext } from "../types.js";
-import type { MediaProvider } from "../../../core/contracts.js";
+import { CameraDisabledError, type MediaProvider } from "../../../core/contracts.js";
 
 /**
  * Pinned to the `camera` capability so intent resolution is this module's alone — the barrel walks every
@@ -43,6 +42,7 @@ describe("camera capability module", () => {
   it("declares the capability + schema", () => {
     expect(CAMERA.capability).toBe("camera");
     expect(CAMERA.properties.map((p) => p.name)).toEqual([
+      "wifiRssi",
       "enabled",
       "imageFlipped",
       "watermark",
@@ -56,6 +56,23 @@ describe("camera capability module", () => {
       "antiTheftDetection",
       "statusLed",
     ]);
+  });
+
+  describe("wifiRssi", () => {
+    it.each([
+      { deviceType: 47, model: "T8425", homeBaseAttached: true },
+      { deviceType: 31, model: "T8410", homeBaseAttached: false },
+    ])("reads reported signal on $model and follows cache updates", (identity) => {
+      const dev = Device.fromRecord("SN", { ...identity, params: { 1142: "-62" } });
+      dev.bindActions(ctx(0, { ...identity, paramIds: new Set([1142]) }), { dispatch: async () => undefined });
+      const acts = dev.camera!()!;
+      expect(acts.wifiRssi).toBe(-62);
+      expect("setWifiRssi" in acts).toBe(false);
+      dev.applyParams({ 1142: "0" });
+      expect(acts.wifiRssi).toBe(0);
+      dev.applyParams({ 1142: "not-a-number" });
+      expect(acts.wifiRssi).toBeUndefined();
+    });
   });
 
   // Every wire here was captured from the app on an indoor pan-tilt (standalone, mains) and read back
@@ -120,6 +137,85 @@ describe("camera capability module", () => {
       const type = buildCommand("soundDetectionType", 1, ctx(0)) as { data: Record<string, unknown> };
       expect(Object.keys(sens.data)).toEqual(["index"]);
       expect(Object.keys(type.data)).toEqual(["type"]);
+    });
+  });
+
+  describe("T8442 night vision (read alias + direct wire)", () => {
+    const t8442 = ctx(2, { model: "T8442", paramIds: new Set([2002]) });
+
+    it("keeps one nightVision property, reads 2002 as Off/Infrared and updates both ways", () => {
+      const dev = Device.fromRecord("TEST-SN", { model: "T8442", params: { 2002: "0" } });
+      const spec = dev.properties.find((p) => p.name === "nightVision");
+      expect(spec).toMatchObject({
+        paramType: 2002,
+        type: "enum",
+        kind: "enum",
+        writable: true,
+        enumValues: { 0: "Off", 1: "Infrared" },
+      });
+      expect(dev.properties.some((p) => p.name === "nightVisionEnabled")).toBe(false);
+      expect(dev.getProperty("nightVision")?.value).toBe(NightVision.Off);
+      dev.applyParams({ 2002: "1" });
+      expect(dev.getProperty("nightVision")?.value).toBe(NightVision.Infrared);
+      dev.applyParams({ 2002: "0" });
+      expect(dev.getProperty("nightVision")?.value).toBe(NightVision.Off);
+      // Even if 1277 appears, the model-specific 2002 alias remains the source of truth.
+      const both = Device.fromRecord("TEST-SN", { model: "T8442", params: { 1277: "2", 2002: "1" } });
+      expect(both.properties.find((p) => p.name === "nightVision")?.paramType).toBe(2002);
+      expect(both.getProperty("nightVision")?.value).toBe(NightVision.Infrared);
+    });
+
+    it("writes 1013 as level-1 int-string for T8442, on and off", () => {
+      expect(buildCommand("nightVision", NightVision.Infrared, t8442)).toEqual({
+        kind: "set-param",
+        param: CAMERA_CMD.IC_NIGHT_VISION_TYPE,
+        value: 1,
+        form: "int-string",
+        channel: 2,
+      });
+      expect(buildCommand("nightVision", NightVision.Off, t8442)).toEqual({
+        kind: "set-param",
+        param: CAMERA_CMD.IC_NIGHT_VISION_TYPE,
+        value: 0,
+        form: "int-string",
+        channel: 2,
+      });
+    });
+
+    it("the bound T8442 setter sends the literal 1013 int-string command", async () => {
+      const { acts, sent } = camera(t8442);
+      await acts.setNightVision!(NightVision.Infrared);
+      expect(sent).toEqual([
+        {
+          kind: "set-param",
+          param: CAMERA_CMD.IC_NIGHT_VISION_TYPE,
+          value: 1,
+          form: "int-string",
+          channel: 2,
+        },
+      ]);
+    });
+
+    it("rejects Full Color on T8442 with a model-specific error", async () => {
+      const message = /nightVision: Full Color is not supported on T8442 \(only Off\/Infrared\)/;
+      expect(() => buildCommand("nightVision", NightVision.FullColor, t8442)).toThrow(message);
+      await expect(camera(t8442).acts.setNightVision!(NightVision.FullColor)).rejects.toThrow(message);
+    });
+
+    it("keeps the 1277 property and 1350 payload for T8425", () => {
+      const older = ctx(3, { model: "T8425", paramIds: new Set([CAMERA_CMD.NIGHT_VISION_TYPE]) });
+      const dev = Device.fromRecord("TEST-SN", { model: "T8425", params: { 1277: "2" } });
+      expect(dev.properties.find((p) => p.name === "nightVision")).toMatchObject({
+        paramType: CAMERA_CMD.NIGHT_VISION_TYPE,
+        enumValues: { 0: "Off", 1: "Infrared", 2: "Full Color" },
+      });
+      expect(dev.getProperty("nightVision")?.value).toBe(NightVision.FullColor);
+      expect(buildCommand("nightVision", NightVision.FullColor, older)).toMatchObject({
+        kind: "set-payload",
+        cmd: CAMERA_CMD.NIGHT_VISION_TYPE,
+        channel: 0,
+        payload: { channel: 3, night_sion: 2 },
+      });
     });
   });
 
@@ -306,23 +402,24 @@ describe("camera capability module", () => {
       expect(byName).toMatchObject({ cmd: CAMERA_CMD.RECORDING_QUALITY_SET, payload: { quality: 1 } });
     });
 
-    it("streamingQuality is read-only: the write is unconfirmed, so no setter exists", () => {
-      // Tier 0 is Auto, which recording has no equivalent for — the domains are not interchangeable.
+    it("streamingQuality → 2730's 1350 payload, and it is NOT the recording wire", () => {
       expect(STREAMING_QUALITY_TIERS[0]).toBe("Auto");
       expect(RECORDING_QUALITY_TIERS[0]).toBeUndefined();
       expect(resolveStreamingQuality(3)).toBe("Max");
-      expect(resolveStreamingQualityTier(StreamingQuality.Auto)).toBe(0);
-      expect(resolveStreamingQualityTier(StreamingQuality.Max)).toBe(3);
-      expect(resolveStreamingQualityTier(0)).toBe(0);
-      for (const bad of [-1, 4, 99, "nope"]) expect(resolveStreamingQualityTier(bad as number)).toBeUndefined();
-      // Replaying the app's 2730 frame from here changed nothing on the device, so the intent throws
-      // rather than reporting the camera as lacking the feature.
-      expect(() => buildCommand("streamingQuality", 2, ctx(0))).toThrow();
-      // The sibling that IS confirmed still routes, and to a different sub-command.
+      const cmd = buildCommand("streamingQuality", StreamingQuality.Auto, ctx(0));
+      expect(cmd).toMatchObject({
+        kind: "set-payload",
+        cmd: CAMERA_CMD.STREAMING_QUALITY_SET,
+        mValue3: 0,
+        form: "auto",
+        payload: { channel: 0, mode: 0, primary_view: 0, quality: 0 },
+      });
+      expect(CAMERA_CMD.STREAMING_QUALITY_SET).not.toBe(CAMERA_CMD.RECORDING_QUALITY_SET);
       expect(buildCommand("recordingQuality", 3, ctx(0))).toMatchObject({
         cmd: CAMERA_CMD.RECORDING_QUALITY_SET,
       });
-      expect(CAMERA_CMD.STREAMING_QUALITY_SET).not.toBe(CAMERA_CMD.RECORDING_QUALITY_SET);
+      expect((cmd as { payload: Record<string, unknown> }).payload.transaction).toMatch(/^\d{13}$/);
+      expect(buildCommand("streamingQuality", "Max", ctx(2))).toMatchObject({ payload: { quality: 3 } });
     });
 
     it("recordingQuality throws on a value that isn't a real tier (no bogus value on the fire-and-forget wire)", () => {
@@ -428,23 +525,41 @@ describe("camera capability module", () => {
     });
 
     /**
-     * These captured families retain the on/off param route.
+     * Every family but the attached S350 writes the on/off param.
      *
      * Confirmed against the current app's own frames: across six cameras of four device types and both
-     * topologies every on/off it sent was `1035`, and the capture carries no `6250` frame. The envelope also
-     * has no level-1 form, so it is unsendable on a session that never negotiates a key.
+     * topologies every on/off it sent was `1035`. None of those cameras was an S350.
      */
-    it("the remaining captured families write the on/off param", () => {
-      for (const deviceType of [
-        DeviceType.INDOOR_COST_DOWN_CAMERA,
-        DeviceType.INDOOR_PT_CAMERA_S350,
-        DeviceType.OUTDOOR_PT_CAMERA,
-      ]) {
+    it("every family but the attached S350 writes the on/off param, none the privacy envelope", () => {
+      for (const deviceType of [DeviceType.INDOOR_COST_DOWN_CAMERA, DeviceType.OUTDOOR_PT_CAMERA]) {
         expect(buildCommand("on", true, ctx(2, { deviceType }))).toMatchObject({
           kind: "set-param",
           param: CAMERA_CMD.CAMERA_ENABLE,
           form: "auto",
           channel: 2,
+        });
+      }
+    });
+
+    /**
+     * Live: on an S350 (T8416), app privacy mode is a state 1035 never touches — a 1035 "on" left the camera
+     * in privacy, recording nothing. Its power is privacy mode, so it rides the same wire `privacy` does.
+     */
+    it("attached S350 powers through the privacy burst: ON ⇒ privacy off, OFF ⇒ privacy on", () => {
+      const c = ctx(5, { deviceType: DeviceType.INDOOR_PT_CAMERA_S350, homeBaseAttached: true });
+      expect(buildCommand("on", true, c)).toEqual({ kind: "p2p-privacy-burst", enabled: false, channel: 5 });
+      expect(buildCommand("off", false, c)).toEqual({ kind: "p2p-privacy-burst", enabled: true, channel: 5 });
+      expect(buildCommand("off", false, c)).toEqual(buildCommand("privacy", true, c));
+    });
+
+    /** Only the attached topology was run; a standalone S350 keeps the auto-sealed 1035 a keyless session can send. */
+    it("standalone S350 stays on the auto-sealed on/off param", () => {
+      for (const homeBaseAttached of [false, undefined]) {
+        const c = ctx(0, { deviceType: DeviceType.INDOOR_PT_CAMERA_S350, homeBaseAttached });
+        expect(buildCommand("off", false, c)).toMatchObject({
+          kind: "set-param",
+          param: CAMERA_CMD.CAMERA_ENABLE,
+          form: "auto",
         });
       }
     });
@@ -576,7 +691,7 @@ describe("camera capability module", () => {
       const { acts, sent } = camera(ctx(0));
       await acts.on();
       await acts.off();
-      await acts.setPrivacy(true);
+      await acts.setPrivacy!(true);
       expect(sent[0]).toMatchObject({ kind: "set-param", form: "auto", value: 0 }); // ON = 0 (default family)
       expect(sent[1]).toMatchObject({ kind: "set-param", form: "auto", value: 1 }); // OFF = 1
       expect(sent[2]).toMatchObject({ kind: "p2p-privacy-burst", enabled: true });
@@ -584,16 +699,16 @@ describe("camera capability module", () => {
 
     it("a derived setter dispatches its member's command; a value the member rejects never reaches the wire", async () => {
       const { acts, sent } = camera(ctx(3));
-      await acts.setWatermark(2);
-      await acts.setRecordingQuality(3);
+      await acts.setWatermark!(2);
+      await acts.setRecordingQuality!(3);
       expect(sent).toHaveLength(2);
       expect(sent[0]).toMatchObject({ param: CAMERA_CMD.SET_DEVS_OSD, value: 2 });
       expect(sent[1]).toMatchObject({ cmd: CAMERA_CMD.RECORDING_QUALITY_SET, payload: { quality: 3 } });
-      await expect(acts.setWatermark(5)).rejects.toThrow("watermark: 5 is not a valid value (must be one of 0/1/2)");
-      await expect(acts.setNightVision(9)).rejects.toThrow(
+      await expect(acts.setWatermark!(5)).rejects.toThrow("watermark: 5 is not a valid value (must be one of 0/1/2)");
+      await expect(acts.setNightVision!(9)).rejects.toThrow(
         "nightVision: 9 is not a valid value (must be one of 0/1/2)",
       );
-      await expect(acts.setRecordingQuality(0)).rejects.toThrow(
+      await expect(acts.setRecordingQuality!(0)).rejects.toThrow(
         "recordingQuality: 0 is not a valid value (must be one of 1/2/3)",
       );
       expect(sent).toHaveLength(2);
@@ -635,6 +750,27 @@ describe("camera capability module", () => {
       };
       expect("openReadable" in camera(ctx(), media).acts).toBe(false);
       expect("downloadRecording" in camera(ctx(), media).acts).toBe(false);
+    });
+
+    it("a lock-codec device carrying camera is offered live view and nothing else", () => {
+      const media: MediaProvider = {
+        snapshotStored: async () => Buffer.alloc(0),
+        snapshotLive: async () => ({ jpeg: Buffer.alloc(0), width: 1, height: 1 }),
+        live: async () => ({}) as never,
+        record: async () => Buffer.alloc(0),
+        openReadable: async () => ({}) as never,
+        recordFragments: () => ({}) as never,
+        downloadRecording: async () => ({}) as never,
+        talkback: async () => ({}) as never,
+      };
+      const evidence = {
+        paramIds: new Set<number>([...Object.values(CAMERA_CMD), 1241, 2001]),
+        capabilities: new Set(["lock", "camera", "snapshot"] as const),
+      };
+      const lock = camera(ctx(0, { codec: "lock", ...evidence }), media).acts as Record<string, unknown>;
+      const offered = Object.keys(lock).filter((k) => typeof lock[k] === "function");
+      expect(offered).toEqual(["live"]);
+      expect(camera(ctx(0, { codec: "camera", ...evidence }), media).acts.setWatermark).toBeTypeOf("function");
     });
 
     it("a stored-recording download passes the pushed recording name and cipher id through unchanged", async () => {
@@ -744,7 +880,7 @@ const _watermark: Exact<typeof cam.watermark, number | undefined> = true;
 
 // Write-only: a setter and no getter, because the device never reports privacy state back.
 const _noPrivacyGetter: Exact<"privacy" extends keyof CameraActions ? true : false, false> = true;
-const _setPrivacy: Exact<Parameters<typeof cam.setPrivacy>[0], boolean> = true;
+const _setPrivacy: Exact<Parameters<NonNullable<typeof cam.setPrivacy>>[0], boolean> = true;
 const _statusLed: Exact<typeof cam.statusLed, boolean | undefined> = true;
 const _setStatusLedOptional: Exact<undefined extends typeof cam.setStatusLed ? true : false, true> = true;
 
@@ -755,9 +891,9 @@ const _recordingQualityWrite: Exact<
   RecordingQualityName | number
 > = true;
 
-// An evidence-gated write is OPTIONAL, so a caller is made to check; an ungated one is not.
+// A gated write is OPTIONAL, so a caller is made to check: by reported evidence, or by codec.
 const _antiTheftOptional: Exact<undefined extends typeof cam.setAntiTheftDetection ? true : false, true> = true;
-const _watermarkRequired: Exact<undefined extends typeof cam.setWatermark ? true : false, false> = true;
+const _watermarkOptional: Exact<undefined extends typeof cam.setWatermark ? true : false, true> = true;
 
 const _snapshotOptional: Exact<undefined extends typeof cam.snapshotStored ? true : false, true> = true;
 const _snapshotReturns: Exact<
@@ -778,7 +914,7 @@ export const _surfaceAssertions = [
   _recordingQualityRead,
   _recordingQualityWrite,
   _antiTheftOptional,
-  _watermarkRequired,
+  _watermarkOptional,
   _snapshotOptional,
   _snapshotReturns,
   _recordArg,
@@ -800,9 +936,9 @@ export const _surfaceAssertions = [
  * `1035`, and none reported both.
  */
 describe("camera enablement — observed write", () => {
-  const observationFor = (deviceType: number, reported: number[], value: boolean) => {
+  const observationFor = (deviceType: number, reported: number[], value: boolean, homeBaseAttached?: boolean) => {
     const member = CAMERA_MEMBERS.enabled;
-    const ctx = { channel: 0, codec: "camera" as const, deviceType, paramIds: new Set(reported) };
+    const ctx = { channel: 0, codec: "camera" as const, deviceType, homeBaseAttached, paramIds: new Set(reported) };
     return member.observation.reflects(value, ctx as never);
   };
 
@@ -840,19 +976,59 @@ describe("camera enablement — observed write", () => {
     expect(observationFor(DeviceType.INDOOR_PT_CAMERA, [], true)).toBeUndefined();
   });
 
-  /**
-   * Every family observes the param it reports. The app was captured writing `1035` to cameras of each, so
-   * the wire written and the wire read agree everywhere and a readback can confirm any of them.
-   */
-  it("observes every family, including the outdoor-PT and S350 ones", () => {
-    expect(observationFor(DeviceType.INDOOR_PT_CAMERA_S350, [CAMERA_ENABLE], true)).toEqual({
+  /** Outdoor-PT is written on the param it reports, so a readback of it confirms the write. */
+  it("observes the outdoor-PT family on the param it reports", () => {
+    expect(observationFor(DeviceType.OUTDOOR_PT_CAMERA, [CAMERA_ENABLE], true)).toEqual({
       param: CAMERA_ENABLE,
       expected: 0,
       observed: true,
     });
-    expect(observationFor(DeviceType.OUTDOOR_PT_CAMERA, [CAMERA_ENABLE], true)).toEqual({
+  });
+
+  /**
+   * The S350 is written through the privacy burst, which the 1035 it reports never follows. Live, an S350's
+   * cloud record carried 1035 and no 6250, so the write dispatches unobserved and the read is named
+   * unreflected rather than waited on.
+   */
+  it("never observes the attached S350 and names its enablement unreflected", () => {
+    expect(observationFor(DeviceType.INDOOR_PT_CAMERA_S350, [CAMERA_ENABLE], true, true)).toBeUndefined();
+    const reflects = CAMERA_MEMBERS.enabled.readReflectsWrite;
+    const cam = (deviceType: number, homeBaseAttached?: boolean) =>
+      ({ channel: 0, codec: "camera", deviceType, homeBaseAttached, paramIds: new Set([CAMERA_ENABLE]) }) as never;
+    expect(reflects(cam(DeviceType.INDOOR_PT_CAMERA_S350, true))).toBe(false);
+    expect(reflects(cam(DeviceType.INDOOR_PT_CAMERA_S350, false))).toBe(true);
+    expect(reflects(cam(9))).toBe(true);
+  });
+
+  /**
+   * An earlier 1035 off can leave the attached S350 reporting off after a burst on() — the burst never moves
+   * 1035 — so that reading does not refuse a media pull.
+   */
+  it("pulls media from an attached S350 that reports 1035 as off", async () => {
+    const media: MediaProvider = {
+      snapshotLive: async () => ({ jpeg: Buffer.from("jpeg"), width: 1, height: 1 }),
+      live: async () => ({}) as never,
+      record: async () => Buffer.alloc(0),
+    };
+    const read = () => ({ value: false });
+    const s350 = (homeBaseAttached: boolean) =>
+      bind<CameraActions>(
+        "camera",
+        ctx(5, {
+          deviceType: DeviceType.INDOOR_PT_CAMERA_S350,
+          homeBaseAttached,
+          paramIds: new Set([CAMERA_ENABLE]),
+        }),
+        { media, read },
+      ).acts;
+    expect((await s350(true).snapshotLive!()).jpeg).toEqual(Buffer.from("jpeg"));
+    await expect(s350(false).snapshotLive!()).rejects.toBeInstanceOf(CameraDisabledError);
+  });
+
+  /** A standalone S350 is written on the 1035 it reports, so it is observed there like any other 1035 family. */
+  it("observes a standalone S350 on the param it reports", () => {
+    expect(observationFor(DeviceType.INDOOR_PT_CAMERA_S350, [CAMERA_ENABLE], true, false)).toMatchObject({
       param: CAMERA_ENABLE,
-      expected: 0,
       observed: true,
     });
   });

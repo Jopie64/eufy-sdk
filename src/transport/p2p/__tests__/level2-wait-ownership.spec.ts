@@ -31,6 +31,7 @@ function setup(hasLevel2Key: boolean, attached = true) {
       {
         sn: DEVICE_SN,
         stationSn: attached ? STATION_SN : DEVICE_SN,
+        channel: 1,
         raw: {
           ...(attached ? { parent_sn: STATION_SN } : {}),
           device_channel: 1,
@@ -111,7 +112,7 @@ describe("resolving a session defers the level-2 wait to the session", () => {
   it("asks with the full grace where the key is a requirement", async () => {
     const { router, session } = setup(true);
     await router.p2pQuery(DEVICE_SN, 6237, { timeoutMs: 5 }).catch(() => {});
-    expect(session.awaitLevel2Key).toHaveBeenCalledWith(HARD_GRACE_MS, "call");
+    expect(session.awaitLevel2Key).toHaveBeenCalledWith(HARD_GRACE_MS, "call", "every");
   });
 
   /** A requirement the session reports it cannot meet is a refusal now, not a wait that ends in one. */
@@ -153,7 +154,7 @@ describe("a set-payload whose seal is the session's", () => {
     expect(session.sendControlLevel2).not.toHaveBeenCalled();
     // The settle wait, charged from connect — never the per-call grace the required-key path spends.
     expect(session.awaitLevel2Key).toHaveBeenCalledWith(SETTLE_GRACE_MS, "session");
-    expect(session.awaitLevel2Key).not.toHaveBeenCalledWith(HARD_GRACE_MS, "call");
+    expect(session.awaitLevel2Key).not.toHaveBeenCalledWith(HARD_GRACE_MS, "call", expect.anything());
   });
 
   /** The behaviour every still-pinned `setPayload` keeps, and the one the fix removed from the rest. */
@@ -162,7 +163,7 @@ describe("a set-payload whose seal is the session's", () => {
 
     await expect(router.dispatchCommand(DEVICE_SN, envelope())).rejects.toBeInstanceOf(StationKeyUnavailableError);
 
-    expect(session.awaitLevel2Key).toHaveBeenCalledWith(HARD_GRACE_MS, "call");
+    expect(session.awaitLevel2Key).toHaveBeenCalledWith(HARD_GRACE_MS, "call", "every");
     expect(session.sendSetPayload).not.toHaveBeenCalled();
   });
 
